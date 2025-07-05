@@ -1,6 +1,7 @@
 package table
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"vqlite/column"
@@ -14,9 +15,18 @@ type TableMeta struct {
 }
 
 type Table struct {
-	Pager   *pager.Pager
-	Meta    *TableMeta
-	NumRows uint32
+	Pager       *pager.Pager
+	Meta        *TableMeta
+	NumRows     uint32
+	rootPageIdx uint32
+}
+
+// Cursor provides a way to iterate through rows in a Table.
+type Cursor struct {
+	table         *Table
+	currentRowIdx uint32
+	pageIdx       uint32
+	cellIdx       uint32
 }
 
 func BuildTableMeta(schema column.Schema) (*TableMeta, error) {
@@ -84,15 +94,29 @@ func OpenTable(filename string, schema column.Schema) (*Table, error) {
 }
 
 func (t *Table) Close() error {
-	rowsPerPage := pager.PageSize / t.Meta.RowSize
-	numPages := (t.NumRows + uint32(rowsPerPage) - 1) / uint32(rowsPerPage)
+	// 1) How many full pages do we have?
+	numRowsPerPage := pager.PageSize / t.Meta.RowSize
+	fullPages := t.NumRows / numRowsPerPage
 
-	for i := uint32(0); i < numPages; i++ {
-		// flush the entire page
-		if err := t.Pager.FlushPage(i, uint32(pager.PageSize)); err != nil {
-			return err
+	// 2) Flush each fully‐occupied page (PageSize bytes).
+	for i := uint32(0); i < fullPages; i++ {
+		if err := t.Pager.FlushPage(i, pager.PageSize); err != nil {
+			return fmt.Errorf("Close: flushing full page %d: %w", i, err)
 		}
 	}
+
+	// 3) Flush the *partial* page, if any rows remain.
+	leftover := t.NumRows % numRowsPerPage
+	if leftover > 0 {
+		pageNum := fullPages
+		// Write only the bytes that actually hold rows:
+		sizeToWrite := leftover * t.Meta.RowSize
+		if err := t.Pager.FlushPage(pageNum, sizeToWrite); err != nil {
+			return fmt.Errorf("Close: flushing partial page %d: %w", pageNum, err)
+		}
+	}
+
+	// 4) Finally, close the underlying file
 	return t.Pager.File.Close()
 }
 
@@ -113,10 +137,17 @@ func (t *Table) rowSlot(rowNum uint32) ([]byte, error) {
 
 func (t *Table) InsertRow(row Row) error {
 	// 1) Get the target slot
-	buf, err := t.rowSlot(t.NumRows)
+	cur, err := t.CursorAt(t.NumRows)
 	if err != nil {
 		return err
 	}
+
+	// 2) Get the raw slot bytes:
+	buf, err := cur.GetValue()
+	if err != nil {
+		return err
+	}
+
 	if err := SerializeRow(t.Meta, row, buf); err != nil {
 		return err
 	}
@@ -127,9 +158,69 @@ func (t *Table) InsertRow(row Row) error {
 }
 
 func (t *Table) GetRow(rowNum uint32) (Row, error) {
-	buf, err := t.rowSlot(rowNum)
+	cursor := t.StartCursor()
+	for i := uint32(0); i < rowNum; i++ {
+		cursor.Advance()
+	}
+	buf, err := cursor.GetValue()
 	if err != nil {
 		return nil, err
 	}
 	return DeserializeRow(t.Meta, buf)
+}
+
+// StartCursor returns a new Cursor positioned at the first row of the table.
+// If the table is empty, End() will be true immediately.
+func (t *Table) StartCursor() *Cursor {
+	rootNodePage, _ := t.Pager.GetPage(t.rootPageIdx)
+	cellIdx := binary.LittleEndian.Uint32(rootNodePage.Data[NodeTypeSize+IsRootSize+ParentPointerSize : NodeTypeSize+IsRootSize+ParentPointerSize+LeafNodeNumCellsSize])
+	return &Cursor{
+		table:         t,
+		currentRowIdx: 0,
+		pageIdx:       t.rootPageIdx,
+		cellIdx:       cellIdx,
+	}
+}
+
+func (t *Table) EndCursor() *Cursor {
+	return &Cursor{
+		table:         t,
+		currentRowIdx: t.NumRows,
+	}
+}
+
+func (c *Cursor) Advance() {
+	if c.currentRowIdx >= c.table.NumRows {
+		return
+	}
+	c.currentRowIdx++
+}
+
+func (c *Cursor) GetValue() ([]byte, error) {
+	if c.currentRowIdx > c.table.NumRows {
+		return nil, fmt.Errorf("Cursor.Value: index %d out of bounds", c.currentRowIdx)
+	}
+	// Calculate page and offset directly
+	pageIdx := c.pageIdx
+	page, err := c.table.Pager.GetPage(pageIdx)
+	if err != nil {
+		return nil, fmt.Errorf("Cursor.Value: failed to load page %d: %w", pageIdx, err)
+	}
+	offset := c.currentRowIdx * c.table.Meta.RowSize
+	// Return the slice of bytes for this row
+	return page.Data[offset : offset+c.table.Meta.RowSize], nil
+}
+
+// Seek the cursor to the given absolute row index (0-based).
+// rowIdx may be equal to t.NumRows if you want to append a new row.
+// Returns an error if rowIdx > t.NumRows.
+func (t *Table) CursorAt(rowIdx uint32) (*Cursor, error) {
+	if rowIdx > t.NumRows {
+		return nil, fmt.Errorf("CursorAt: row index %d out of bounds (NumRows=%d)", rowIdx, t.NumRows)
+	}
+	return &Cursor{
+		table:         t,
+		currentRowIdx: rowIdx,
+		// we no longer need endOfTable for writes; you can check rowIdx==NumRows yourself
+	}, nil
 }
