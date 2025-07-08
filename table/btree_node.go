@@ -3,6 +3,7 @@ package table
 import (
 	"encoding/binary"
 	"fmt"
+	"slices"
 	"sort"
 	"vqlite/pager"
 )
@@ -48,6 +49,7 @@ type LeafNode struct {
 	header    baseHeader
 	cells     []LeafCell
 	tableMeta *TableMeta
+	bTreeMeta *BTreeMeta
 }
 
 func (n *LeafNode) Page() uint32 {
@@ -55,16 +57,54 @@ func (n *LeafNode) Page() uint32 {
 }
 func (n *LeafNode) IsLeaf() bool { return true }
 
+func NewLeafNode(meta *BTreeMeta, pgno uint32, isRoot bool) *LeafNode {
+	return &LeafNode{
+		bTreeMeta: meta,
+		header: baseHeader{
+			pageNum:      pgno,
+			isRoot:       isRoot,
+			parentPage:   0,
+			numCells:     0,
+			rightPointer: 0,
+		},
+		cells: make([]LeafCell, 0, maxCells), // one extra for split work
+	}
+}
+
 // Insert a key/value into the sorted leaf.  If overflow, split.
 func (n *LeafNode) Insert(key uint32, value Row) (BTreeNode, uint32, bool) {
 	// find insertion index
 	idx := sort.Search(int(n.header.numCells), func(i int) bool {
 		return n.cells[i].Key >= key
 	})
-	// splice into slice
-	n.cells = append(n.cells, LeafCell{})
-	copy(n.cells[idx+1:], n.cells[idx:])
-	n.cells[idx] = LeafCell{Key: key, Value: value}
+
+	newCell := LeafCell{Key: key, Value: value}
+	n.cells = slices.Insert(n.cells, idx, newCell)
+
+	if len(n.cells) > maxCells {
+		// 1) Ask the pager for a new page number:
+		newPgno, err := n.bTreeMeta.Pager.AllocatePage()
+		if err != nil {
+			panic(err) // or return an error variant
+		}
+
+		// 2) Build the sibling with that page number:
+		sibling := NewLeafNode(n.bTreeMeta, newPgno, false)
+		//      copy the “right half” of the cells into it:
+		mid := len(n.cells) / 2
+		sibling.cells = append(sibling.cells, n.cells[mid:]...)
+		sibling.header.numCells = uint32(len(sibling.cells))
+		sibling.header.rightPointer = n.header.rightPointer
+
+		// 3) Trim the original:
+		n.cells = n.cells[:mid]
+		n.header.numCells = uint32(len(n.cells))
+		n.header.rightPointer = newPgno
+
+		// 4) Return sibling (with its pageNum set!), the splitKey, and true:
+		return sibling, sibling.cells[0].Key, true
+	}
+
 	n.header.numCells = uint32(len(n.cells))
 	return nil, 0, false
 }

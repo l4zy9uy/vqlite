@@ -105,3 +105,12 @@ func (p *Pager) FlushPage(pageNum uint32, size uint32) error {
 
 	return nil
 }
+
+func (p *Pager) AllocatePage() (uint32, error) {
+	np := uint32(p.FileLength / PageSize)
+	if np >= TableMaxPages {
+		return 0, fmt.Errorf("AllocatePage: out of space")
+	}
+	p.FileLength += PageSize
+	return np, nil
+}

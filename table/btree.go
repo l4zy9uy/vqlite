@@ -7,11 +7,20 @@ import (
 	"vqlite/pager"
 )
 
+const (
+	maxCells = 12
+)
+
 // BTree manages the overall tree: root page, pager, and table meta.
 type BTree struct {
 	pager    *pager.Pager
 	rootPage uint32
 	meta     *TableMeta
+}
+
+type BTreeMeta struct {
+	Pager     *pager.Pager // for allocating pages, pageSize, etc.
+	TableMeta *TableMeta   // schema, row sizes, max cells
 }
 
 // NewBTree opens or initializes a B+Tree on page 0.
@@ -93,7 +102,7 @@ func (t *BTree) Insert(key uint32, row Row) error {
 	}
 
 	// 3) root split: allocate a new root page
-	newRootPage, err := t.allocatePage()
+	newRootPage, err := t.AllocatePage()
 	if err != nil {
 		return err
 	}
@@ -169,11 +178,11 @@ func (t *BTree) loadNode(pageNum uint32) (BTreeNode, error) {
 	}
 }
 
-// allocatePage hands out the next free page number.
-func (t *BTree) allocatePage() (uint32, error) {
+// AllocatePage hands out the next free page number.
+func (t *BTree) AllocatePage() (uint32, error) {
 	np := uint32(t.pager.FileLength / pager.PageSize)
 	if np >= pager.TableMaxPages {
-		return 0, fmt.Errorf("allocatePage: out of space")
+		return 0, fmt.Errorf("AllocatePage: out of space")
 	}
 	t.pager.FileLength += pager.PageSize
 	return np, nil
