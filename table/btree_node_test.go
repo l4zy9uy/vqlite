@@ -9,7 +9,8 @@ import (
 	"vqlite/pager"
 )
 
-// helper to create a temporary pager file
+// tempPager wraps a Pager backed by a temporary on-disk file so each test
+// has an isolated database. The file is removed in cleanup().
 type tempPager struct {
 	*pager.Pager
 	filename string
@@ -33,15 +34,15 @@ func (tp *tempPager) cleanup() {
 	os.Remove(tp.filename)
 }
 
-// TestLeafNode_SerializeLoad tests that inserting into a LeafNode, serializing and loading
-// preserves keys and row data correctly.
+// TestLeafNode_SerializeLoad inserts a few rows, serializes the leaf to disk,
+// loads it back, and verifies both keys and row values are preserved.
 func TestLeafNode_SerializeLoad(t *testing.T) {
-	// Define a simple schema: id INT, name TEXT(8)
+	// id INT, name TEXT(8)
 	schema := column.Schema{
 		{Name: "id", Type: column.ColumnTypeInt},
 		{Name: "name", Type: column.ColumnTypeText, MaxLength: 8},
 	}
-	meta, err := BuildTableMeta(schema)
+	tblMeta, err := BuildTableMeta(schema)
 	if err != nil {
 		t.Fatalf("BuildTableMeta: %v", err)
 	}
@@ -49,54 +50,56 @@ func TestLeafNode_SerializeLoad(t *testing.T) {
 	tp := newTempPager(t)
 	defer tp.cleanup()
 
-	// Obtain page 0 from pager
-	page, err := tp.GetPage(0)
+	btMeta := &BTreeMeta{Pager: tp.Pager, TableMeta: tblMeta}
+
+	leaf, err := NewLeafNode(btMeta, true)
 	if err != nil {
-		t.Fatalf("GetPage: %v", err)
+		t.Fatalf("NewLeafNode: %v", err)
 	}
 
-	// Create a LeafNode and insert some rows
-	leaf := &LeafNode{tableMeta: meta}
-	leaf.header.pageNum = 0
-	// header.isRoot and parentPage default to false/0
-
-	tests := []Row{
+	// Insert three rows out of order
+	rows := []Row{
 		{uint32(10), "Alice"},
 		{uint32(5), "Bob"},
 		{uint32(20), "Carol"},
 	}
-	// Insert in arbitrary order
-	for _, r := range tests {
-		leaf.Insert(r[0].(uint32), r)
+	for _, r := range rows {
+		if _, _, split := leaf.Insert(r[0].(uint32), r); split {
+			t.Fatalf("unexpected split during setup")
+		}
 	}
 
-	// Serialize to page
+	// Serialize to its on-disk page
+	page, err := tp.GetPage(leaf.Page())
+	if err != nil {
+		t.Fatalf("GetPage: %v", err)
+	}
 	if err := leaf.Serialize(page); err != nil {
-		t.Fatalf("Serialize failed: %v", err)
+		t.Fatalf("Serialize: %v", err)
 	}
 
-	// Load into a new LeafNode
-	loaded := &LeafNode{tableMeta: meta}
-	loaded.header.pageNum = 0
+	// Load into a fresh LeafNode instance
+	loaded := &LeafNode{bTreeMeta: btMeta}
+	loaded.header.pageNum = leaf.Page()
 	if err := loaded.Load(page); err != nil {
-		t.Fatalf("Load failed: %v", err)
+		t.Fatalf("Load: %v", err)
 	}
 
-	// Verify number of cells
 	if loaded.header.numCells != leaf.header.numCells {
 		t.Errorf("numCells = %d; want %d", loaded.header.numCells, leaf.header.numCells)
 	}
 
+	// Expect keys in ascending order 5,10,20
 	wantKeys := []uint32{5, 10, 20}
-	var gotKeys []uint32
+	gotKeys := make([]uint32, 0, loaded.header.numCells)
 	for _, c := range loaded.cells {
 		gotKeys = append(gotKeys, c.Key)
 	}
 	if !reflect.DeepEqual(gotKeys, wantKeys) {
-		t.Errorf("Keys = %v; want %v", gotKeys, wantKeys)
+		t.Errorf("keys = %v; want %v", gotKeys, wantKeys)
 	}
 
-	// Verify row values preserved in sorted order
+	// Check row contents preserve order
 	wantRows := []Row{
 		{uint32(5), "Bob"},
 		{uint32(10), "Alice"},
@@ -104,61 +107,58 @@ func TestLeafNode_SerializeLoad(t *testing.T) {
 	}
 	for i, c := range loaded.cells {
 		if !reflect.DeepEqual(c.Value, wantRows[i]) {
-			t.Errorf("Cell %d row = %v; want %v", i, c.Value, wantRows[i])
+			t.Errorf("row %d = %v; want %v", i, c.Value, wantRows[i])
 		}
 	}
 }
 
-// TestLeafNode_LoadError tests that Load returns an error when page is not a leaf.
+// TestLeafNode_LoadError verifies Load returns an error when the page’s type byte
+// does not indicate a leaf node.
 func TestLeafNode_LoadError(t *testing.T) {
 	tp := newTempPager(t)
 	defer tp.cleanup()
 
-	page, err := tp.GetPage(0)
+	pgno, err := tp.Pager.AllocatePage()
 	if err != nil {
-		t.Fatalf("GetPage: %v", err)
+		t.Fatalf("AllocatePage: %v", err)
 	}
-	// Set page type to interior
-	page.Data[0] = nodeTypeInterior
+	page, _ := tp.GetPage(pgno)
+	page.Data[0] = nodeTypeInterior // mark as interior
 
-	loaded := &LeafNode{tableMeta: &TableMeta{}}
-	err = loaded.Load(page)
-	if err == nil {
-		t.Errorf("Load should have failed for non-leaf page")
+	leaf := &LeafNode{bTreeMeta: &BTreeMeta{TableMeta: &TableMeta{}}}
+	if err := leaf.Load(page); err == nil {
+		t.Errorf("Load should fail for non-leaf page")
 	}
 }
 
-// TestInteriorNode_SerializeLoad tests that Serialize/Load roundtrip for InteriorNode
+// TestInteriorNode_SerializeLoad creates an interior node, serializes it, then
+// loads it back and ensures the header and cell array round-trip intact.
 func TestInteriorNode_SerializeLoad(t *testing.T) {
 	tp := newTempPager(t)
 	defer tp.cleanup()
 
-	pageNum := uint32(1)
-	page, err := tp.GetPage(pageNum)
-	if err != nil {
-		t.Fatalf("GetPage: %v", err)
+	pgno, _ := tp.Pager.AllocatePage()
+	page, _ := tp.GetPage(pgno)
+
+	interior := &InteriorNode{
+		bTreeMeta: &BTreeMeta{},
+		header: baseHeader{
+			pageNum:      pgno,
+			isRoot:       true,
+			numCells:     2,
+			rightPointer: 3,
+		},
+		cells: []InteriorCell{{ChildPage: 10, Key: 100}, {ChildPage: 20, Key: 200}},
 	}
 
-	// Build an InteriorNode with two cells
-	interior := &InteriorNode{}
-	interior.header.pageNum = pageNum
-	interior.header.isRoot = true
-	interior.header.numCells = 2
-	interior.header.rightPointer = 3
-	interior.cells = []InteriorCell{
-		{ChildPage: 10, Key: 100},
-		{ChildPage: 20, Key: 200},
-	}
-
-	// Serialize
 	if err := interior.Serialize(page); err != nil {
-		t.Fatalf("Interior Serialize failed: %v", err)
+		t.Fatalf("Serialize: %v", err)
 	}
 
-	// Load into new node
-	loaded := &InteriorNode{}
+	loaded := &InteriorNode{bTreeMeta: &BTreeMeta{}}
+	loaded.header.pageNum = pgno
 	if err := loaded.Load(page); err != nil {
-		t.Fatalf("Interior Load failed: %v", err)
+		t.Fatalf("Load: %v", err)
 	}
 
 	if loaded.header.numCells != interior.header.numCells {
@@ -167,29 +167,26 @@ func TestInteriorNode_SerializeLoad(t *testing.T) {
 	if loaded.header.rightPointer != interior.header.rightPointer {
 		t.Errorf("rightPointer = %d; want %d", loaded.header.rightPointer, interior.header.rightPointer)
 	}
-
-	// Check cells
 	if !reflect.DeepEqual(loaded.cells, interior.cells) {
-		t.Errorf("Cells = %v; want %v", loaded.cells, interior.cells)
+		t.Errorf("cells = %v; want %v", loaded.cells, interior.cells)
 	}
 }
 
-// TestLeafNode_Insert_NoSplit ensures Insert maintains sorted order
-// and correct counts when number of cells <= maxCells.
+// TestLeafNode_Insert_NoSplit ensures inserts maintain sorted key order and
+// no split occurs while the number of cells ≤ maxCells.
 func TestLeafNode_Insert_NoSplit(t *testing.T) {
 	tp := newTempPager(t)
 	defer tp.cleanup()
 
-	// Simple schema with one INT column
 	schema := column.Schema{{Name: "id", Type: column.ColumnTypeInt}}
-	meta, err := BuildTableMeta(schema)
-	if err != nil {
-		t.Fatalf("BuildTableMeta: %v", err)
-	}
-	btm := &BTreeMeta{Pager: tp.Pager, TableMeta: meta}
+	tblMeta, _ := BuildTableMeta(schema)
+	btMeta := &BTreeMeta{Pager: tp.Pager, TableMeta: tblMeta}
 
-	// Create leaf at page 7
-	leaf := NewLeafNode(btm, 7, true)
+	leaf, err := NewLeafNode(btMeta, true)
+	if err != nil {
+		t.Fatalf("NewLeafNode: %v", err)
+	}
+	originalPage := leaf.Page()
 
 	keys := []uint32{42, 7, 99, 7}
 	for i, k := range keys {
@@ -197,87 +194,68 @@ func TestLeafNode_Insert_NoSplit(t *testing.T) {
 		if newNode != nil || splitKey != 0 || split {
 			t.Errorf("Insert(%d) = (%v,%d,%v); want (nil,0,false)", k, newNode, splitKey, split)
 		}
-		if leaf.Page() != 7 {
-			t.Errorf("Page() = %d; want 7", leaf.Page())
+		if leaf.Page() != originalPage {
+			t.Errorf("Page changed from %d to %d", originalPage, leaf.Page())
 		}
-		wantCount := uint32(i + 1)
-		if leaf.header.numCells != wantCount {
-			t.Errorf("numCells = %d; want %d", leaf.header.numCells, wantCount)
+		if want := uint32(i + 1); leaf.header.numCells != want {
+			t.Errorf("numCells = %d; want %d", leaf.header.numCells, want)
 		}
 	}
 
-	// After all inserts, keys should be sorted (duplicates allowed)
-	want := []uint32{7, 7, 42, 99}
-	var got []uint32
+	wantKeys := []uint32{7, 7, 42, 99}
+	got := make([]uint32, 0, len(leaf.cells))
 	for _, c := range leaf.cells {
 		got = append(got, c.Key)
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("sorted keys = %v; want %v", got, want)
+	if !reflect.DeepEqual(got, wantKeys) {
+		t.Errorf("sorted keys = %v; want %v", got, wantKeys)
 	}
 }
 
-// TestLeafNode_Insert_Split verifies that inserting one more than maxCells
-// triggers a split, with correct splitKey, node sizes, and page numbers.
+// TestLeafNode_Insert_Split inserts maxCells+1 rows to trigger a split and
+// validates the resulting sibling node, splitKey, and cell distribution.
 func TestLeafNode_Insert_Split(t *testing.T) {
 	tp := newTempPager(t)
 	defer tp.cleanup()
 
 	schema := column.Schema{{Name: "id", Type: column.ColumnTypeInt}}
-	meta, err := BuildTableMeta(schema)
-	if err != nil {
-		t.Fatalf("BuildTableMeta: %v", err)
-	}
-	btm := &BTreeMeta{Pager: tp.Pager, TableMeta: meta}
+	tblMeta, _ := BuildTableMeta(schema)
+	btMeta := &BTreeMeta{Pager: tp.Pager, TableMeta: tblMeta}
 
-	// Allocate initial page for the leaf so it's tracked by pager
-	rootPg, err := tp.Pager.AllocatePage()
+	leaf, err := NewLeafNode(btMeta, true)
 	if err != nil {
-		t.Fatalf("AllocatePage: %v", err)
+		t.Fatalf("NewLeafNode: %v", err)
 	}
-	leaf := NewLeafNode(btm, rootPg, true)
 
-	// Insert maxCells items (no split)
+	// Fill to capacity
 	for i := uint32(0); i < maxCells; i++ {
-		newNode, _, split := leaf.Insert(i, Row{i})
-		if split || newNode != nil {
-			t.Fatalf("unexpected split on insert #%d", i)
+		if n, _, split := leaf.Insert(i, Row{i}); split || n != nil {
+			t.Fatalf("unexpected split while inserting %d", i)
 		}
 	}
 
-	// Insert one more to exceed maxCells and trigger split
-	newNode, splitKey, split := leaf.Insert(maxCells, Row{maxCells})
-	if !split {
-		t.Fatalf("expected split on insert #%d", maxCells)
-	}
-	if newNode == nil {
-		t.Fatal("expected non-nil sibling node after split")
+	// One more insert should split
+	sibling, splitKey, split := leaf.Insert(maxCells, Row{maxCells})
+	if !split || sibling == nil {
+		t.Fatalf("expected split on insert %d", maxCells)
 	}
 
-	// Calculate expected page numbers
-	wantSibPg := rootPg + 1
-	if newNode.Page() != wantSibPg {
-		t.Errorf("sibling Page() = %d; want %d", newNode.Page(), wantSibPg)
-	}
-	if leaf.header.rightPointer != wantSibPg {
-		t.Errorf("rightPointer = %d; want %d", leaf.header.rightPointer, wantSibPg)
+	// The rightPointer of the left node should point to the sibling’s page.
+	if leaf.header.rightPointer != sibling.Page() {
+		t.Errorf("rightPointer = %d; want %d", leaf.header.rightPointer, sibling.Page())
 	}
 
-	// Determine expected node sizes
-	mid := (maxCells + 1) / 2
-	wantLeft := mid
-	wantRight := (maxCells + 1) - mid
-	if leaf.header.numCells != uint32(wantLeft) {
-		t.Errorf("left numCells = %d; want %d", leaf.header.numCells, wantLeft)
+	// Verify left/right cell counts
+	mid := (maxCells + 1) / 2 // as computed in implementation
+	if want := uint32(mid); leaf.header.numCells != want {
+		t.Errorf("left numCells = %d; want %d", leaf.header.numCells, want)
 	}
-	rn := newNode.(*LeafNode).header.numCells
-	if rn := rn; rn != uint32(wantRight) {
-		t.Errorf("right numCells = %d; want %d", rn, wantRight)
+	if want := uint32((maxCells + 1) - mid); sibling.(*LeafNode).header.numCells != want {
+		t.Errorf("right numCells = %d; want %d", sibling.(*LeafNode).header.numCells, want)
 	}
 
-	// splitKey should match first key in sibling
-	firstKey := newNode.(*LeafNode).cells[0].Key
-	if splitKey != firstKey {
+	// splitKey should equal first key in sibling
+	if firstKey := sibling.(*LeafNode).cells[0].Key; splitKey != firstKey {
 		t.Errorf("splitKey = %d; want %d", splitKey, firstKey)
 	}
 }

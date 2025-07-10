@@ -30,13 +30,13 @@ type Cursor struct {
 }
 
 func BuildTableMeta(schema column.Schema) (*TableMeta, error) {
-	var metas []column.ColMeta
+	var metas []column.Column
 	var offset uint32 = 0
 
 	for _, col := range schema {
 		switch col.Type {
 		case column.ColumnTypeInt:
-			metas = append(metas, column.ColMeta{
+			metas = append(metas, column.Column{
 				Name:      col.Name,
 				Type:      column.ColumnTypeInt,
 				Offset:    offset,
@@ -49,7 +49,7 @@ func BuildTableMeta(schema column.Schema) (*TableMeta, error) {
 			if col.MaxLength == 0 {
 				return nil, fmt.Errorf("TEXT column %q must have MaxLength>0", col.Name)
 			}
-			metas = append(metas, column.ColMeta{
+			metas = append(metas, column.Column{
 				Name:      col.Name,
 				Type:      column.ColumnTypeText,
 				Offset:    offset,
@@ -85,7 +85,7 @@ func OpenTable(filename string, schema column.Schema) (*Table, error) {
 	if err != nil {
 		return nil, err
 	}
-	numRows := uint32(pg.FileLength / uint64(meta.RowSize))
+	numRows := uint32(pg.NumPages*pager.PageSize) / meta.RowSize
 	return &Table{
 		Pager:   pg,
 		Meta:    meta,
@@ -100,7 +100,7 @@ func (t *Table) Close() error {
 
 	// 2) Flush each fully‐occupied page (PageSize bytes).
 	for i := uint32(0); i < fullPages; i++ {
-		if err := t.Pager.FlushPage(i, pager.PageSize); err != nil {
+		if err := t.Pager.FlushPage(i); err != nil {
 			return fmt.Errorf("Close: flushing full page %d: %w", i, err)
 		}
 	}
@@ -110,8 +110,7 @@ func (t *Table) Close() error {
 	if leftover > 0 {
 		pageNum := fullPages
 		// Write only the bytes that actually hold rows:
-		sizeToWrite := leftover * t.Meta.RowSize
-		if err := t.Pager.FlushPage(pageNum, sizeToWrite); err != nil {
+		if err := t.Pager.FlushPage(pageNum); err != nil {
 			return fmt.Errorf("Close: flushing partial page %d: %w", pageNum, err)
 		}
 	}

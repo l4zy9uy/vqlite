@@ -7,7 +7,7 @@ const (
 	ColumnTypeText
 )
 
-type ColMeta struct {
+type Column struct {
 	Name      string
 	Type      ColumnType
 	Offset    uint32
@@ -15,4 +15,4 @@ type ColMeta struct {
 	MaxLength uint32
 }
 
-type Schema []ColMeta
+type Schema []Column

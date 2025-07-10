@@ -48,7 +48,6 @@ type InteriorCell struct {
 type LeafNode struct {
 	header    baseHeader
 	cells     []LeafCell
-	tableMeta *TableMeta
 	bTreeMeta *BTreeMeta
 }
 
@@ -57,8 +56,16 @@ func (n *LeafNode) Page() uint32 {
 }
 func (n *LeafNode) IsLeaf() bool { return true }
 
-func NewLeafNode(meta *BTreeMeta, pgno uint32, isRoot bool) *LeafNode {
-	return &LeafNode{
+// NewLeafNode allocates a fresh page and returns a new leaf node
+func NewLeafNode(meta *BTreeMeta, isRoot bool) (*LeafNode, error) {
+	// 1) Allocate a fresh page (from free-list or by extending the file)
+	pgno, err := meta.Pager.AllocatePage()
+	if err != nil {
+		return nil, fmt.Errorf("NewLeafNode: could not allocate page: %w", err)
+	}
+
+	// 2) Build the in-memory node with that page number
+	n := &LeafNode{
 		bTreeMeta: meta,
 		header: baseHeader{
 			pageNum:      pgno,
@@ -67,8 +74,17 @@ func NewLeafNode(meta *BTreeMeta, pgno uint32, isRoot bool) *LeafNode {
 			numCells:     0,
 			rightPointer: 0,
 		},
-		cells: make([]LeafCell, 0, maxCells), // one extra for split work
+		cells: make([]LeafCell, 0, maxCells),
 	}
+
+	// 3) Mark the page dirty so on next flush it will be zeroed & initialized
+	pg, err := meta.Pager.GetPage(pgno)
+	if err != nil {
+		return nil, fmt.Errorf("NewLeafNode: could not get page: %w", err)
+	}
+	pg.Dirty = true
+
+	return n, nil
 }
 
 // Insert a key/value into the sorted leaf.  If overflow, split.
@@ -82,14 +98,11 @@ func (n *LeafNode) Insert(key uint32, value Row) (BTreeNode, uint32, bool) {
 	n.cells = slices.Insert(n.cells, idx, newCell)
 
 	if len(n.cells) > maxCells {
-		// 1) Ask the pager for a new page number:
-		newPgno, err := n.bTreeMeta.Pager.AllocatePage()
-		if err != nil {
-			panic(err) // or return an error variant
-		}
-
 		// 2) Build the sibling with that page number:
-		sibling := NewLeafNode(n.bTreeMeta, newPgno, false)
+		sibling, err := NewLeafNode(n.bTreeMeta, false)
+		if err != nil {
+			panic(err)
+		}
 		//      copy the “right half” of the cells into it:
 		mid := len(n.cells) / 2
 		sibling.cells = append(sibling.cells, n.cells[mid:]...)
@@ -99,7 +112,7 @@ func (n *LeafNode) Insert(key uint32, value Row) (BTreeNode, uint32, bool) {
 		// 3) Trim the original:
 		n.cells = n.cells[:mid]
 		n.header.numCells = uint32(len(n.cells))
-		n.header.rightPointer = newPgno
+		n.header.rightPointer = sibling.Page()
 
 		// 4) Return sibling (with its pageNum set!), the splitKey, and true:
 		return sibling, sibling.cells[0].Key, true
@@ -125,10 +138,10 @@ func (n *LeafNode) Serialize(p *pager.Page) error {
 		binary.LittleEndian.PutUint32(p.Data[off:off+4], c.Key)
 		off += 4
 		// serialize full row
-		if err := SerializeRow(n.tableMeta, c.Value, p.Data[off:off+int(n.tableMeta.RowSize)]); err != nil {
+		if err := SerializeRow(n.bTreeMeta.TableMeta, c.Value, p.Data[off:off+int(n.bTreeMeta.TableMeta.RowSize)]); err != nil {
 			return fmt.Errorf("LeafNode.Serialize: %w", err)
 		}
-		off += int(n.tableMeta.RowSize)
+		off += int(n.bTreeMeta.TableMeta.RowSize)
 	}
 	return nil
 }
@@ -144,10 +157,10 @@ func (n *LeafNode) Load(p *pager.Page) error {
 	for i := 0; i < cnt; i++ {
 		key := binary.LittleEndian.Uint32(p.Data[off : off+4])
 		off += 4
-		buf := make([]byte, n.tableMeta.RowSize)
-		copy(buf, p.Data[off:off+int(n.tableMeta.RowSize)])
-		off += int(n.tableMeta.RowSize)
-		row, err := DeserializeRow(n.tableMeta, buf)
+		buf := make([]byte, n.bTreeMeta.TableMeta.RowSize)
+		copy(buf, p.Data[off:off+int(n.bTreeMeta.TableMeta.RowSize)])
+		off += int(n.bTreeMeta.TableMeta.RowSize)
+		row, err := DeserializeRow(n.bTreeMeta.TableMeta, buf)
 		if err != nil {
 			return fmt.Errorf("LeafNode.Load: %w", err)
 		}
@@ -158,8 +171,9 @@ func (n *LeafNode) Load(p *pager.Page) error {
 
 // InteriorNode implements BTreeNode for interior pages.
 type InteriorNode struct {
-	header baseHeader
-	cells  []InteriorCell
+	header    baseHeader
+	cells     []InteriorCell
+	bTreeMeta *BTreeMeta
 }
 
 func (n *InteriorNode) Page() uint32 {
@@ -168,11 +182,71 @@ func (n *InteriorNode) Page() uint32 {
 
 func (n *InteriorNode) IsLeaf() bool { return false }
 
+func NewInteriorNode(meta *BTreeMeta, pgno uint32, isRoot bool) *InteriorNode {
+	return &InteriorNode{
+		bTreeMeta: meta,
+		header: baseHeader{
+			pageNum:      pgno,
+			isRoot:       isRoot,
+			parentPage:   0,
+			numCells:     0,
+			rightPointer: 0,
+		},
+		cells: make([]InteriorCell, 0, maxCells),
+	}
+}
+
 // Insert is a stub: you’ll hook in recursive descent and splitting here next.
-func (n *InteriorNode) Insert(key uint32, row Row) (BTreeNode, uint32, bool) {
-	// TODO: 1) find child index, 2) load child via BTree.loadNode,
-	// 3) call child.Insert, 4) if split, splice into this.cells, split if needed.
-	return nil, 0, false
+// InteriorNode.Insert inserts into an interior. Propagates splits upward.
+func (n *InteriorNode) Insert(key uint32, value Row) (BTreeNode, uint32, bool) {
+	// 1) find child index
+	i := sort.Search(len(n.cells), func(i int) bool { return n.cells[i].Key >= key })
+	// choose child page
+	var childPg uint32
+	if i < len(n.cells) {
+		childPg = n.cells[i].ChildPage
+	} else {
+		childPg = n.header.rightPointer
+	}
+	// 2) load child page
+	p, _ := n.bTreeMeta.Pager.GetPage(childPg)
+	// 3) instantiate child node
+	var child BTreeNode
+	if p.Data[0] == nodeTypeLeaf {
+		child, _ = NewLeafNode(n.bTreeMeta, false)
+	} else {
+		child = NewInteriorNode(n.bTreeMeta, childPg, false)
+	}
+	child.Load(p)
+	// 4) recurse
+	sib, splitKey, didSplit := child.Insert(key, value)
+	if !didSplit {
+		child.Serialize(p)
+		n.header.numCells = uint32(len(n.cells))
+		return nil, 0, false
+	}
+	// 5) splice new cell
+	n.cells = slices.Insert(n.cells, i, InteriorCell{ChildPage: sib.Page(), Key: splitKey})
+	n.header.numCells = uint32(len(n.cells))
+	// 6) handle interior overflow
+	if len(n.cells) > maxCells {
+		newPg, _ := n.bTreeMeta.Pager.AllocatePage()
+		sibInt := NewInteriorNode(n.bTreeMeta, newPg, false)
+		mid := len(n.cells) / 2
+		// median cell to push up
+		med := n.cells[mid]
+		// right half -> sibling
+		sibInt.cells = append(sibInt.cells, n.cells[mid+1:]...)
+		sibInt.header.numCells = uint32(len(sibInt.cells))
+		sibInt.header.rightPointer = n.header.rightPointer
+		// left keep
+		n.cells = n.cells[:mid]
+		n.header.numCells = uint32(len(n.cells))
+		n.header.rightPointer = med.ChildPage
+		// return sibling interior
+		return sibInt, med.Key, true
+	}
+	return sib, splitKey, true
 }
 
 // Serialize writes header + each InteriorCell ([ childPage:uint32 | key:uint32 ]).

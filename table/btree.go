@@ -13,9 +13,9 @@ const (
 
 // BTree manages the overall tree: root page, pager, and table meta.
 type BTree struct {
-	pager    *pager.Pager
-	rootPage uint32
-	meta     *TableMeta
+	pager     *pager.Pager
+	rootPage  uint32
+	bTreeMeta *BTreeMeta
 }
 
 type BTreeMeta struct {
@@ -27,18 +27,13 @@ type BTreeMeta struct {
 // If the file is empty, it allocates page 0.
 // You must pass in your TableMeta so leaf nodes know how to
 // serialize/deserialize full rows.
-func NewBTree(p *pager.Pager, meta *TableMeta) (*BTree, error) {
-	numPages := uint32(p.FileLength / pager.PageSize)
-	if numPages == 0 {
-		// allocate first page
-		p.FileLength += pager.PageSize
-	}
-	return &BTree{
-		pager:    p,
-		rootPage: 0,
-		meta:     meta,
-	}, nil
-}
+//func NewBTree(p *pager.Pager, meta *TableMeta) (*BTree, error) {
+//	return &BTree{
+//		pager:    p,
+//		rootPage: 0,
+//		meta:     meta,
+//	}, nil
+//}
 
 // Search looks for key in the tree.
 // Returns the full row, true if found, or (nil,false,nil) if not.
@@ -155,7 +150,7 @@ func (t *BTree) loadNode(pageNum uint32) (BTreeNode, error) {
 
 	switch p.Data[0] {
 	case nodeTypeLeaf:
-		leaf := &LeafNode{tableMeta: t.meta}
+		leaf := &LeafNode{bTreeMeta: t.bTreeMeta}
 		leaf.header.pageNum = pageNum
 		if err := leaf.Load(p); err != nil {
 			return nil, err
@@ -180,12 +175,7 @@ func (t *BTree) loadNode(pageNum uint32) (BTreeNode, error) {
 
 // AllocatePage hands out the next free page number.
 func (t *BTree) AllocatePage() (uint32, error) {
-	np := uint32(t.pager.FileLength / pager.PageSize)
-	if np >= pager.TableMaxPages {
-		return 0, fmt.Errorf("AllocatePage: out of space")
-	}
-	t.pager.FileLength += pager.PageSize
-	return np, nil
+	return 0, nil
 }
 
 // rootHeader pulls the baseHeader out of a node, if possible.
