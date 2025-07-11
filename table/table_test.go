@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"testing"
 	"vqlite/column"
+	"vqlite/pager"
 )
 
 func newTempDB(t *testing.T) string {
@@ -82,11 +83,16 @@ func TestInsertGetRow_FileBacked(t *testing.T) {
 		{Name: "id", Type: column.ColumnTypeInt},
 		{Name: "name", Type: column.ColumnTypeText, MaxLength: 16},
 	}
-	table, err := OpenTable(dbFile, schema)
+
+	pg, err := pager.OpenPager(dbFile)
 	if err != nil {
-		t.Fatalf("OpenTable: %v", err)
+		t.Fatalf("OpenPager: %v", err)
 	}
-	defer table.Close()
+	meta, _ := BuildTableMeta(schema)
+	bt, err := NewBTree(pg, meta)
+	if err != nil {
+		t.Fatalf("NewBTree: %v", err)
+	}
 
 	rows := []Row{
 		{uint32(1), "Alice"},
@@ -94,22 +100,21 @@ func TestInsertGetRow_FileBacked(t *testing.T) {
 		{uint32(3), "Carol"},
 	}
 	for _, r := range rows {
-		if err := table.InsertRow(r); err != nil {
-			t.Fatalf("insertRow: %v", err)
+		if err := bt.Insert(r[0].(uint32), r); err != nil {
+			t.Fatalf("Insert: %v", err)
 		}
 	}
 
-	if table.NumRows != uint32(len(rows)) {
-		t.Errorf("NumRows = %d; want %d", table.NumRows, len(rows))
-	}
-
-	for i, want := range rows {
-		got, err := table.GetRow(uint32(i))
+	for _, want := range rows {
+		got, found, err := bt.Search(want[0].(uint32))
 		if err != nil {
-			t.Fatalf("getRow(%d): %v", i, err)
+			t.Fatalf("Search: %v", err)
+		}
+		if !found {
+			t.Fatalf("key %v not found", want[0])
 		}
 		if !reflect.DeepEqual(want, got) {
-			t.Errorf("Row %d = %+v; want %+v", i, got, want)
+			t.Errorf("Row for key %v = %+v; want %+v", want[0], got, want)
 		}
 	}
 }

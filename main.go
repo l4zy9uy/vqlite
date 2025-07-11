@@ -5,7 +5,8 @@ import (
 	"os"
 	"strings"
 	"vqlite/column"
-	table2 "vqlite/table"
+	"vqlite/pager"
+	"vqlite/table"
 )
 
 func doMetaCommand(input string) MetaCommandResult {
@@ -45,44 +46,38 @@ func main() {
 		{Name: "age", Type: column.ColumnTypeInt},
 	}
 
-	// 2) Open (or create) the database file with that schema
-	table, err := table2.OpenTable("test.db", schema)
+	// Open pager & B-tree (will create new tree if file empty)
+	pg, err := pager.OpenPager("test.db")
 	if err != nil {
-		fmt.Println("Error opening table:", err)
+		fmt.Println("open pager:", err)
 		return
 	}
-	// Ensure we flush & close on exit
-	defer func() {
-		if err := table.Close(); err != nil {
-			fmt.Println("Error closing table:", err)
-		}
-	}()
+	meta, _ := table.BuildTableMeta(schema)
+	bt, err := table.NewBTree(pg, meta)
+	if err != nil {
+		fmt.Println("NewBTree:", err)
+		return
+	}
 
-	// 3) Insert a couple of rows
-	toInsert := []table2.Row{
+	// Insert rows
+	rows := []table.Row{
 		{uint32(1), "alice", "alice@example.com", uint32(30)},
 		{uint32(2), "bob", "bob@example.com", uint32(25)},
 	}
-
-	for _, r := range toInsert {
-		if err := table.InsertRow(r); err != nil {
-			fmt.Println("Error inserting row:", err)
+	for _, r := range rows {
+		if err := bt.Insert(r[0].(uint32), r); err != nil {
+			fmt.Println("insert:", err)
 			return
 		}
 	}
-	fmt.Printf("Inserted %d rows.\n\n", table.NumRows)
 
-	// 4) Read them back and print
-	for i := uint32(0); i < table.NumRows; i++ {
-		rowVals, err := table.GetRow(i)
-		if err != nil {
-			fmt.Println("Error fetching row:", err)
-			return
+	// Fetch and print
+	for _, r := range rows {
+		got, found, _ := bt.Search(r[0].(uint32))
+		if !found {
+			fmt.Println("row not found", r[0])
+			continue
 		}
-		fmt.Printf("Row %d:\n", i)
-		for j, val := range rowVals {
-			fmt.Printf("  %s = %v\n", schema[j].Name, val)
-		}
-		fmt.Println()
+		fmt.Printf("Row key %d: %v\n", r[0].(uint32), got)
 	}
 }
