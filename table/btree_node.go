@@ -182,8 +182,17 @@ func (n *InteriorNode) Page() uint32 {
 
 func (n *InteriorNode) IsLeaf() bool { return false }
 
-func NewInteriorNode(meta *BTreeMeta, pgno uint32, isRoot bool) *InteriorNode {
-	return &InteriorNode{
+// NewInteriorNode allocates a fresh page (like NewLeafNode) and returns an
+// empty interior node. The caller should set header.rightPointer and/or cells
+// before serialization if needed.
+func NewInteriorNode(meta *BTreeMeta, isRoot bool) (*InteriorNode, error) {
+	// 1) allocate new page
+	pgno, err := meta.Pager.AllocatePage()
+	if err != nil {
+		return nil, fmt.Errorf("NewInteriorNode: could not allocate page: %w", err)
+	}
+
+	n := &InteriorNode{
 		bTreeMeta: meta,
 		header: baseHeader{
 			pageNum:      pgno,
@@ -194,6 +203,15 @@ func NewInteriorNode(meta *BTreeMeta, pgno uint32, isRoot bool) *InteriorNode {
 		},
 		cells: make([]InteriorCell, 0, maxCells),
 	}
+
+	// mark page dirty so it will be zeroed/serialized later
+	pg, err := meta.Pager.GetPage(pgno)
+	if err != nil {
+		return nil, fmt.Errorf("NewInteriorNode: could not get page: %w", err)
+	}
+	pg.Dirty = true
+
+	return n, nil
 }
 
 // Insert is a stub: you’ll hook in recursive descent and splitting here next.
@@ -201,7 +219,7 @@ func NewInteriorNode(meta *BTreeMeta, pgno uint32, isRoot bool) *InteriorNode {
 func (n *InteriorNode) Insert(key uint32, value Row) (BTreeNode, uint32, bool) {
 	// 1) find child index
 	i := sort.Search(len(n.cells), func(i int) bool { return n.cells[i].Key >= key })
-	// choose child page
+	// choose the child page
 	var childPg uint32
 	if i < len(n.cells) {
 		childPg = n.cells[i].ChildPage
@@ -210,28 +228,40 @@ func (n *InteriorNode) Insert(key uint32, value Row) (BTreeNode, uint32, bool) {
 	}
 	// 2) load child page
 	p, _ := n.bTreeMeta.Pager.GetPage(childPg)
-	// 3) instantiate child node
+	// 3) instantiate child node struct _without allocating new pages_
 	var child BTreeNode
 	if p.Data[0] == nodeTypeLeaf {
-		child, _ = NewLeafNode(n.bTreeMeta, false)
+		// Use a zero LeafNode bound to the existing page
+		leaf := &LeafNode{bTreeMeta: n.bTreeMeta}
+		leaf.header.pageNum = childPg
+		child = leaf
 	} else {
-		child = NewInteriorNode(n.bTreeMeta, childPg, false)
+		in := &InteriorNode{bTreeMeta: n.bTreeMeta}
+		in.header.pageNum = childPg
+		child = in
 	}
-	child.Load(p)
+	// populate it from disk
+	if err := child.Load(p); err != nil {
+		return nil, 0, false // propagate error silently for now
+	}
 	// 4) recurse
 	sib, splitKey, didSplit := child.Insert(key, value)
 	if !didSplit {
+		// Child accepted insert with no split: serialize child back and we’re done.
 		child.Serialize(p)
-		n.header.numCells = uint32(len(n.cells))
 		return nil, 0, false
 	}
 	// 5) splice new cell
+	// Child split – insert separator key+pointer into this node
 	n.cells = slices.Insert(n.cells, i, InteriorCell{ChildPage: sib.Page(), Key: splitKey})
 	n.header.numCells = uint32(len(n.cells))
 	// 6) handle interior overflow
 	if len(n.cells) > maxCells {
-		newPg, _ := n.bTreeMeta.Pager.AllocatePage()
-		sibInt := NewInteriorNode(n.bTreeMeta, newPg, false)
+		// This interior now overflows – split it as well
+		sibInt, err := NewInteriorNode(n.bTreeMeta, false)
+		if err != nil {
+			panic(err)
+		}
 		mid := len(n.cells) / 2
 		// median cell to push up
 		med := n.cells[mid]
@@ -243,10 +273,30 @@ func (n *InteriorNode) Insert(key uint32, value Row) (BTreeNode, uint32, bool) {
 		n.cells = n.cells[:mid]
 		n.header.numCells = uint32(len(n.cells))
 		n.header.rightPointer = med.ChildPage
-		// return sibling interior
+		// Serialize left (n) and right (sibInt) nodes
+		if pgN, _ := n.bTreeMeta.Pager.GetPage(n.Page()); pgN != nil {
+			n.Serialize(pgN)
+		}
+		if pgS, _ := n.bTreeMeta.Pager.GetPage(sibInt.Page()); pgS != nil {
+			sibInt.Serialize(pgS)
+		}
+
+		// propagate split upward
 		return sibInt, med.Key, true
 	}
-	return sib, splitKey, true
+	// No overflow after inserting separator. Serialize self and child/sibling.
+	if pgChild, _ := n.bTreeMeta.Pager.GetPage(child.Page()); pgChild != nil {
+		child.Serialize(pgChild)
+	}
+	if pgSib, _ := n.bTreeMeta.Pager.GetPage(sib.Page()); pgSib != nil {
+		sib.Serialize(pgSib)
+	}
+	if pgSelf, _ := n.bTreeMeta.Pager.GetPage(n.Page()); pgSelf != nil {
+		n.Serialize(pgSelf)
+	}
+
+	// Don’t propagate – our node did not split.
+	return nil, 0, false
 }
 
 // Serialize writes header + each InteriorCell ([ childPage:uint32 | key:uint32 ]).
