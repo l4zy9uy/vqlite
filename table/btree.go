@@ -1,6 +1,7 @@
 package table
 
 import (
+	"encoding/binary"
 	"fmt"
 	"sort"
 
@@ -9,13 +10,16 @@ import (
 
 const (
 	maxCells = 12
+
+	metaPageNum = uint32(0) // page 0 reserved for tree metadata
+	metaRootOff = 0         // little-endian uint32 root page number
 )
 
 // BTree manages the overall tree: root page, pager, and table meta.
 type BTree struct {
-	pager     *pager.Pager
-	rootPage  uint32
-	bTreeMeta *BTreeMeta
+	pager     *pager.Pager // underlying pager
+	rootPage  uint32       // page number of the root node
+	bTreeMeta *BTreeMeta   // convenience pointer for leaf/interior creation
 }
 
 type BTreeMeta struct {
@@ -23,17 +27,45 @@ type BTreeMeta struct {
 	TableMeta *TableMeta   // schema, row sizes, max cells
 }
 
-// NewBTree opens or initializes a B+Tree on page 0.
-// If the file is empty, it allocates page 0.
-// You must pass in your TableMeta so leaf nodes know how to
-// serialize/deserialize full rows.
-//func NewBTree(p *pager.Pager, meta *TableMeta) (*BTree, error) {
-//	return &BTree{
-//		pager:    p,
-//		rootPage: 0,
-//		meta:     meta,
-//	}, nil
-//}
+// NewBTree opens or initializes a B+Tree.
+// If the underlying pager has no pages yet, it allocates a new root leaf page
+// and serializes an empty leaf node marked as root.
+func NewBTree(p *pager.Pager, tblMeta *TableMeta) (*BTree, error) {
+	btMeta := &BTreeMeta{Pager: p, TableMeta: tblMeta}
+
+	// Case 1: brand-new file – allocate meta page (0) and root leaf (1).
+	if p.NumPages == 0 {
+		// Ensure meta page 0 exists
+		if _, err := p.AllocatePage(); err != nil { // page 0
+			return nil, err
+		}
+
+		// Create root leaf
+		leaf, err := NewLeafNode(btMeta, true)
+		if err != nil {
+			return nil, fmt.Errorf("NewBTree: %w", err)
+		}
+		lp, _ := p.GetPage(leaf.Page())
+		if err := leaf.Serialize(lp); err != nil {
+			return nil, err
+		}
+
+		// Write root page number into meta page
+		mp, _ := p.GetPage(metaPageNum)
+		binary.LittleEndian.PutUint32(mp.Data[metaRootOff:metaRootOff+4], leaf.Page())
+		mp.Dirty = true
+
+		return &BTree{pager: p, rootPage: leaf.Page(), bTreeMeta: btMeta}, nil
+	}
+
+	// Case 2: existing file – read root page number from meta page 0
+	mp, err := p.GetPage(metaPageNum)
+	if err != nil {
+		return nil, err
+	}
+	rootPg := binary.LittleEndian.Uint32(mp.Data[metaRootOff : metaRootOff+4])
+	return &BTree{pager: p, rootPage: rootPg, bTreeMeta: btMeta}, nil
+}
 
 // Search looks for key in the tree.
 // Returns the full row, true if found, or (nil,false,nil) if not.
@@ -135,8 +167,11 @@ func (t *BTree) Insert(key uint32, row Row) error {
 		return err
 	}
 
-	// 7) update the tree’s root pointer
+	// 7) update tree’s root pointer in memory and on disk (meta page 0)
 	t.rootPage = newRootPage
+	mp, _ := t.pager.GetPage(metaPageNum)
+	binary.LittleEndian.PutUint32(mp.Data[metaRootOff:metaRootOff+4], newRootPage)
+	mp.Dirty = true
 	return nil
 }
 
@@ -160,7 +195,7 @@ func (t *BTree) loadNode(pageNum uint32) (BTreeNode, error) {
 		return leaf, nil
 
 	case nodeTypeInterior:
-		inode := &InteriorNode{}
+		inode := &InteriorNode{bTreeMeta: t.bTreeMeta}
 		inode.header.pageNum = pageNum
 		if err := inode.Load(p); err != nil {
 			return nil, err
@@ -175,7 +210,7 @@ func (t *BTree) loadNode(pageNum uint32) (BTreeNode, error) {
 
 // AllocatePage hands out the next free page number.
 func (t *BTree) AllocatePage() (uint32, error) {
-	return 0, nil
+	return t.pager.AllocatePage()
 }
 
 // rootHeader pulls the baseHeader out of a node, if possible.
