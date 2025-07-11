@@ -259,3 +259,162 @@ func TestLeafNode_Insert_Split(t *testing.T) {
 		t.Errorf("splitKey = %d; want %d", splitKey, firstKey)
 	}
 }
+
+// TestInteriorNode_Insert_LeafSplit ensures that when a child leaf overflows
+// and splits, the parent interior absorbs a new cell without overflowing.
+func TestInteriorNode_Insert_LeafSplit(t *testing.T) {
+	tp := newTempPager(t)
+	defer tp.cleanup()
+
+	// Simple INT schema for rows (only the key is stored)
+	schema := column.Schema{{Name: "id", Type: column.ColumnTypeInt}}
+	tblMeta, _ := BuildTableMeta(schema)
+	btMeta := &BTreeMeta{Pager: tp.Pager, TableMeta: tblMeta}
+
+	// Create a leaf node that will sit under the interior root
+	leaf, err := NewLeafNode(btMeta, false)
+	if err != nil {
+		t.Fatalf("NewLeafNode: %v", err)
+	}
+
+	// Fill leaf to capacity (maxCells) without triggering split
+	for i := uint32(0); i < maxCells; i++ {
+		if _, _, split := leaf.Insert(i, Row{i}); split {
+			t.Fatalf("unexpected split while seeding leaf (i=%d)", i)
+		}
+	}
+
+	// Serialize leaf to disk so the interior can load it later
+	leafPg, _ := tp.GetPage(leaf.Page())
+	if err := leaf.Serialize(leafPg); err != nil {
+		t.Fatalf("serialize leaf: %v", err)
+	}
+
+	// Build an interior root whose rightPointer points to the leaf
+	root, err := NewInteriorNode(btMeta, true)
+	if err != nil {
+		t.Fatalf("NewInteriorNode: %v", err)
+	}
+	root.header.rightPointer = leaf.Page()
+
+	// Insert a key that will cause the child leaf to split
+	newKey := uint32(maxCells) // one greater than existing max key in leaf
+	newRow := Row{newKey}
+	newNode, splitKey, split := root.Insert(newKey, newRow)
+
+	// The root itself should *not* split in this scenario
+	if split || newNode != nil || splitKey != 0 {
+		t.Fatalf("root.Insert returned unexpected split (node=%v, key=%d, split=%v)", newNode, splitKey, split)
+	}
+
+	// After the operation, root should have exactly one cell referencing the new sibling
+	if root.header.numCells != 1 {
+		t.Fatalf("root header.numCells = %d; want 1", root.header.numCells)
+	}
+
+	// The key promoted from the leaf split should be the first key of the sibling leaf
+	promotedKey := root.cells[0].Key
+	expectedPromoted := uint32(maxCells / 2)
+	if promotedKey != expectedPromoted {
+		t.Errorf("promoted key = %d; want %d", promotedKey, expectedPromoted)
+	}
+
+	// Ensure the child page numbers are valid and distinct
+	if root.cells[0].ChildPage == leaf.Page() {
+		t.Errorf("ChildPage for new cell should be sibling, got original leaf page %d", leaf.Page())
+	}
+}
+
+// TestInteriorNode_Insert_InteriorSplit builds an interior node already at
+// capacity (maxCells).  Inserting a key causes the rightmost leaf to split,
+// which in turn overflows the interior. We expect the interior itself to split
+// and propagate upward (Insert should return (sibling, splitKey, true)).
+func TestInteriorNode_Insert_InteriorSplit(t *testing.T) {
+	tp := newTempPager(t)
+	defer tp.cleanup()
+
+	schema := column.Schema{{Name: "id", Type: column.ColumnTypeInt}}
+	tblMeta, _ := BuildTableMeta(schema)
+	btMeta := &BTreeMeta{Pager: tp.Pager, TableMeta: tblMeta}
+
+	// Helper to make a leaf with a single key value
+	makeLeafWithKey := func(k uint32) *LeafNode {
+		leaf, err := NewLeafNode(btMeta, false)
+		if err != nil {
+			t.Fatalf("NewLeafNode: %v", err)
+		}
+		leaf.Insert(k, Row{k})
+		pg, _ := tp.GetPage(leaf.Page())
+		if err := leaf.Serialize(pg); err != nil {
+			t.Fatalf("serialize leaf %d: %v", k, err)
+		}
+		return leaf
+	}
+
+	// Create leaves for each cell plus a rightmost leaf that is *full* so it
+	// will split upon one more insert.
+	var leaves []*LeafNode
+	keysForCells := make([]uint32, 0, maxCells)
+	for i := 0; i < maxCells; i++ {
+		k := uint32(i*10 + 5) // 5,15,25,...
+		keysForCells = append(keysForCells, k)
+		leaves = append(leaves, makeLeafWithKey(k))
+	}
+
+	// Rightmost leaf filled to capacity
+	rightLeaf, err := NewLeafNode(btMeta, false)
+	if err != nil {
+		t.Fatalf("NewLeafNode right: %v", err)
+	}
+	for i := uint32(0); i < maxCells; i++ {
+		if _, _, split := rightLeaf.Insert(1000+i, Row{1000 + i}); split {
+			t.Fatalf("unexpected split while seeding right leaf")
+		}
+	}
+	pgRight, _ := tp.GetPage(rightLeaf.Page())
+	if err := rightLeaf.Serialize(pgRight); err != nil {
+		t.Fatalf("serialize right leaf: %v", err)
+	}
+
+	// Build the interior root at capacity
+	root, err := NewInteriorNode(btMeta, true)
+	if err != nil {
+		t.Fatalf("NewInteriorNode: %v", err)
+	}
+	for i, k := range keysForCells {
+		root.cells = append(root.cells, InteriorCell{ChildPage: leaves[i].Page(), Key: k})
+	}
+	root.header.numCells = uint32(maxCells)
+	root.header.rightPointer = rightLeaf.Page()
+
+	// Insert a key that will land in the rightmost leaf, forcing it to split
+	bigKey := uint32(5000)
+	newNode, splitKey, split := root.Insert(bigKey, Row{bigKey})
+
+	if !split || newNode == nil {
+		t.Fatalf("expected root to split; got split=%v newNode=%v", split, newNode)
+	}
+
+	// Validate sibling is an interior node and has expected number of cells
+	sibInt, ok := newNode.(*InteriorNode)
+	if !ok {
+		t.Fatalf("sibling is not *InteriorNode, got %T", newNode)
+	}
+
+	// After split: left and right should each have maxCells/2 cells.
+	leftCells := int(root.header.numCells)
+	rightCells := int(sibInt.header.numCells)
+	mid := maxCells / 2
+	if leftCells != mid {
+		t.Errorf("left numCells = %d; want %d", leftCells, mid)
+	}
+	if rightCells != maxCells-mid {
+		t.Errorf("right numCells = %d; want %d", rightCells, maxCells-mid)
+	}
+
+	// The splitKey should equal the promoted median key
+	expectedMed := keysForCells[mid]
+	if splitKey != expectedMed {
+		t.Errorf("splitKey = %d; want %d", splitKey, expectedMed)
+	}
+}
