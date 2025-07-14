@@ -78,86 +78,114 @@ func NewBTree(p *pager.Pager, tblMeta *TableMeta) (*BTree, error) {
 // Search looks for key in the tree.
 // Returns the full row, true if found, or (nil,false,nil) if not.
 func (t *BTree) Search(key uint32) (Row, bool, error) {
-	node, err := t.loadNode(t.rootPage)
+	// Use cursor's efficient Seek functionality
+	cursor, err := t.NewCursor()
 	if err != nil {
 		return nil, false, err
 	}
-	return t.searchNode(node, key)
-}
 
-// recursive helper for Search
-func (t *BTree) searchNode(node BTreeNode, key uint32) (Row, bool, error) {
-	if node.IsLeaf() {
-		leaf := node.(*LeafNode)
-		idx := sort.Search(int(leaf.header.numCells), func(i int) bool {
-			return leaf.cells[i].Key >= key
-		})
-		if idx < int(leaf.header.numCells) && leaf.cells[idx].Key == key {
-			return leaf.cells[idx].Value, true, nil
-		}
-		return nil, false, nil
-	}
-
-	interior := node.(*InteriorNode)
-	// find the first cell whose Key is greater than search key
-	for _, cell := range interior.cells {
-		if key < cell.Key {
-			child, err := t.loadNode(cell.ChildPage)
-			if err != nil {
-				return nil, false, err
-			}
-			return t.searchNode(child, key)
-		}
-	}
-	// otherwise descend to the rightmost pointer
-	child, err := t.loadNode(interior.header.rightPointer)
-	if err != nil {
+	// Seek to the target key
+	if err := cursor.Seek(key); err != nil {
 		return nil, false, err
 	}
-	return t.searchNode(child, key)
+
+	// Check if we found the exact key
+	if cursor.Valid() && cursor.Key() == key {
+		return cursor.Value(), true, nil
+	}
+
+	return nil, false, nil
 }
 
 // Insert adds key+row into the tree, splitting and promoting at the root if needed.
 func (t *BTree) Insert(key uint32, row Row) error {
-	// 1) load the root node
 	root, err := t.loadNode(t.rootPage)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to load root node: %w", err)
 	}
 
-	// 2) attempt to insert into root
 	sibling, splitKey, didSplit := root.Insert(key, row)
 	if !didSplit {
-		// no split — just serialize the modified root
-		p, err := t.bTreeMeta.Pager.GetPage(t.rootPage)
-		if err != nil {
-			return err
-		}
-		return root.Serialize(p)
+		return t.handleNoSplit(root)
 	}
 
-	// 3) root split: allocate a new root page
+	return t.handleRootSplit(root, sibling, splitKey)
+}
+
+// handleNoSplit handles the case where insertion doesn't cause a split.
+func (t *BTree) handleNoSplit(root BTreeNode) error {
+	page, err := t.bTreeMeta.Pager.GetPage(t.rootPage)
+	if err != nil {
+		return fmt.Errorf("failed to get root page for serialization: %w", err)
+	}
+
+	if err := root.Serialize(page); err != nil {
+		return fmt.Errorf("failed to serialize root node: %w", err)
+	}
+
+	return nil
+}
+
+// handleRootSplit handles the case where the root splits and a new root needs to be created.
+func (t *BTree) handleRootSplit(oldRoot, sibling BTreeNode, splitKey uint32) error {
+	// Allocate new root page
 	newRootPage, err := t.AllocatePage()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to allocate new root page: %w", err)
 	}
 
-	// 4) clear the old root’s isRoot flag and re-serialize it
-	if hdr := rootHeader(root); hdr != nil {
+	// Update old root to no longer be root and serialize it
+	if err := t.demoteOldRoot(oldRoot); err != nil {
+		return fmt.Errorf("failed to demote old root: %w", err)
+	}
+
+	// Serialize the new sibling
+	if err := t.serializeSibling(sibling); err != nil {
+		return fmt.Errorf("failed to serialize sibling: %w", err)
+	}
+
+	// Create and serialize new interior root
+	if err := t.createNewRoot(newRootPage, oldRoot, sibling, splitKey); err != nil {
+		return fmt.Errorf("failed to create new root: %w", err)
+	}
+
+	// Update tree's root pointer in memory and on disk
+	if err := t.updateRootPointer(newRootPage); err != nil {
+		return fmt.Errorf("failed to update root pointer: %w", err)
+	}
+
+	return nil
+}
+
+// demoteOldRoot clears the isRoot flag of the old root and re-serializes it.
+func (t *BTree) demoteOldRoot(oldRoot BTreeNode) error {
+	if hdr := rootHeader(oldRoot); hdr != nil {
 		hdr.isRoot = false
-		oldP, _ := t.bTreeMeta.Pager.GetPage(root.Page())
-		if err := root.Serialize(oldP); err != nil {
-			return err
+		page, err := t.bTreeMeta.Pager.GetPage(oldRoot.Page())
+		if err != nil {
+			return fmt.Errorf("failed to get old root page: %w", err)
+		}
+		if err := oldRoot.Serialize(page); err != nil {
+			return fmt.Errorf("failed to serialize demoted root: %w", err)
 		}
 	}
+	return nil
+}
 
-	// 5) serialize the new sibling (it must already carry its pageNum)
-	sibP, _ := t.bTreeMeta.Pager.GetPage(sibling.Page())
-	if err := sibling.Serialize(sibP); err != nil {
-		return err
+// serializeSibling serializes the sibling node to its page.
+func (t *BTree) serializeSibling(sibling BTreeNode) error {
+	sibPage, err := t.bTreeMeta.Pager.GetPage(sibling.Page())
+	if err != nil {
+		return fmt.Errorf("failed to get sibling page: %w", err)
 	}
+	if err := sibling.Serialize(sibPage); err != nil {
+		return fmt.Errorf("failed to serialize sibling: %w", err)
+	}
+	return nil
+}
 
-	// 6) build and serialize the new interior root
+// createNewRoot builds and serializes the new interior root node.
+func (t *BTree) createNewRoot(newRootPage uint32, oldRoot, sibling BTreeNode, splitKey uint32) error {
 	newRoot := &InteriorNode{
 		header: baseHeader{
 			pageNum:      newRootPage,
@@ -167,19 +195,34 @@ func (t *BTree) Insert(key uint32, row Row) error {
 			rightPointer: sibling.Page(),
 		},
 		cells: []InteriorCell{
-			{ChildPage: root.Page(), Key: splitKey},
+			{ChildPage: oldRoot.Page(), Key: splitKey},
 		},
 	}
-	nrP, _ := t.bTreeMeta.Pager.GetPage(newRootPage)
-	if err := newRoot.Serialize(nrP); err != nil {
-		return err
+
+	newRootPageObj, err := t.bTreeMeta.Pager.GetPage(newRootPage)
+	if err != nil {
+		return fmt.Errorf("failed to get new root page: %w", err)
 	}
 
-	// 7) update tree’s root pointer in memory and on disk (meta page 0)
+	if err := newRoot.Serialize(newRootPageObj); err != nil {
+		return fmt.Errorf("failed to serialize new root: %w", err)
+	}
+
+	return nil
+}
+
+// updateRootPointer updates the tree's root pointer both in memory and on disk.
+func (t *BTree) updateRootPointer(newRootPage uint32) error {
 	t.rootPage = newRootPage
-	mp, _ := t.bTreeMeta.Pager.GetPage(metaPageNum)
-	binary.LittleEndian.PutUint32(mp.Data[metaRootOff:metaRootOff+4], newRootPage)
-	mp.Dirty = true
+
+	metaPage, err := t.bTreeMeta.Pager.GetPage(metaPageNum)
+	if err != nil {
+		return fmt.Errorf("failed to get meta page: %w", err)
+	}
+
+	binary.LittleEndian.PutUint32(metaPage.Data[metaRootOff:metaRootOff+4], newRootPage)
+	metaPage.Dirty = true
+
 	return nil
 }
 
@@ -314,43 +357,56 @@ func (c *Cursor) Next() error {
 	return nil
 }
 
-// Seek repositions the cursor to the first key >= target key.
-func (c *Cursor) Seek(target uint32) error {
-	// Descend from root to leaf
-	pgno := c.tree.rootPage
+// findLeafForKey traverses the tree to find the leaf node that should contain the given key.
+// Returns the leaf node and its page number.
+func (t *BTree) findLeafForKey(key uint32) (*LeafNode, uint32, error) {
+	pgno := t.rootPage
 	for {
-		node, err := c.tree.loadNode(pgno)
+		node, err := t.loadNode(pgno)
 		if err != nil {
-			return err
+			return nil, 0, err
 		}
 		if node.IsLeaf() {
-			leaf := node.(*LeafNode)
-			idx := sort.Search(int(leaf.header.numCells), func(i int) bool {
-				return leaf.cells[i].Key >= target
-			})
-			if idx >= int(leaf.header.numCells) {
-				// Target doesn't exist in the tree - interior nodes guaranteed
-				// we're in the correct leaf, so if target > all keys here, it doesn't exist
-				c.valid = false
-				return nil
-			}
-			c.leaf = leaf
-			c.page = pgno
-			c.idx = idx
-			c.valid = true
-			return nil
+			return node.(*LeafNode), pgno, nil
 		}
-		in := node.(*InteriorNode)
-		// Binary search for the first cell with Key >= target
-		idx := sort.Search(len(in.cells), func(i int) bool {
-			return in.cells[i].Key >= target
-		})
-		var childPg uint32
-		if idx < len(in.cells) {
-			childPg = in.cells[idx].ChildPage
-		} else {
-			childPg = in.header.rightPointer
-		}
-		pgno = childPg
+
+		interior := node.(*InteriorNode)
+		pgno = t.findChildPageInInterior(interior, key)
 	}
+}
+
+// findChildPageInInterior finds the appropriate child page for a given key in an interior node.
+// Uses binary search for efficiency, consistent with the Seek implementation.
+func (t *BTree) findChildPageInInterior(interior *InteriorNode, key uint32) uint32 {
+	// Binary search for the first cell with Key >= key
+	idx := sort.Search(len(interior.cells), func(i int) bool {
+		return interior.cells[i].Key >= key
+	})
+
+	if idx < len(interior.cells) {
+		return interior.cells[idx].ChildPage
+	}
+	return interior.header.rightPointer
+}
+
+// Seek repositions the cursor to the first key >= target key.
+func (c *Cursor) Seek(target uint32) error {
+	// Find the appropriate leaf node
+	leaf, pgno, err := c.tree.findLeafForKey(target)
+	if err != nil {
+		return err
+	}
+
+	// Binary search within the leaf for the target key
+	idx := sort.Search(int(leaf.header.numCells), func(i int) bool {
+		return leaf.cells[i].Key >= target
+	})
+
+	// Update cursor state
+	c.leaf = leaf
+	c.page = pgno
+	c.idx = idx
+	c.valid = idx < int(leaf.header.numCells)
+
+	return nil
 }
