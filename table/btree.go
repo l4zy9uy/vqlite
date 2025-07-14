@@ -15,11 +15,19 @@ const (
 	metaRootOff = 0         // little-endian uint32 root page number
 )
 
-// BTree manages the overall tree: root page, pager, and table meta.
+// BTree manages the overall tree: root page and table meta.
 type BTree struct {
-	pager     *pager.Pager // underlying pager
-	rootPage  uint32       // page number of the root node
-	bTreeMeta *BTreeMeta   // convenience pointer for leaf/interior creation
+	rootPage  uint32     // page number of the root node
+	bTreeMeta *BTreeMeta // convenience pointer for leaf/interior creation
+}
+
+// Cursor enables ordered traversal of the B+Tree.
+type Cursor struct {
+	tree  *BTree
+	leaf  *LeafNode
+	page  uint32
+	idx   int
+	valid bool
 }
 
 type BTreeMeta struct {
@@ -55,7 +63,7 @@ func NewBTree(p *pager.Pager, tblMeta *TableMeta) (*BTree, error) {
 		binary.LittleEndian.PutUint32(mp.Data[metaRootOff:metaRootOff+4], leaf.Page())
 		mp.Dirty = true
 
-		return &BTree{pager: p, rootPage: leaf.Page(), bTreeMeta: btMeta}, nil
+		return &BTree{rootPage: leaf.Page(), bTreeMeta: btMeta}, nil
 	}
 
 	// Case 2: existing file – read root page number from meta page 0
@@ -64,7 +72,7 @@ func NewBTree(p *pager.Pager, tblMeta *TableMeta) (*BTree, error) {
 		return nil, err
 	}
 	rootPg := binary.LittleEndian.Uint32(mp.Data[metaRootOff : metaRootOff+4])
-	return &BTree{pager: p, rootPage: rootPg, bTreeMeta: btMeta}, nil
+	return &BTree{rootPage: rootPg, bTreeMeta: btMeta}, nil
 }
 
 // Search looks for key in the tree.
@@ -121,7 +129,7 @@ func (t *BTree) Insert(key uint32, row Row) error {
 	sibling, splitKey, didSplit := root.Insert(key, row)
 	if !didSplit {
 		// no split — just serialize the modified root
-		p, err := t.pager.GetPage(t.rootPage)
+		p, err := t.bTreeMeta.Pager.GetPage(t.rootPage)
 		if err != nil {
 			return err
 		}
@@ -137,14 +145,14 @@ func (t *BTree) Insert(key uint32, row Row) error {
 	// 4) clear the old root’s isRoot flag and re-serialize it
 	if hdr := rootHeader(root); hdr != nil {
 		hdr.isRoot = false
-		oldP, _ := t.pager.GetPage(root.Page())
+		oldP, _ := t.bTreeMeta.Pager.GetPage(root.Page())
 		if err := root.Serialize(oldP); err != nil {
 			return err
 		}
 	}
 
 	// 5) serialize the new sibling (it must already carry its pageNum)
-	sibP, _ := t.pager.GetPage(sibling.Page())
+	sibP, _ := t.bTreeMeta.Pager.GetPage(sibling.Page())
 	if err := sibling.Serialize(sibP); err != nil {
 		return err
 	}
@@ -162,14 +170,14 @@ func (t *BTree) Insert(key uint32, row Row) error {
 			{ChildPage: root.Page(), Key: splitKey},
 		},
 	}
-	nrP, _ := t.pager.GetPage(newRootPage)
+	nrP, _ := t.bTreeMeta.Pager.GetPage(newRootPage)
 	if err := newRoot.Serialize(nrP); err != nil {
 		return err
 	}
 
 	// 7) update tree’s root pointer in memory and on disk (meta page 0)
 	t.rootPage = newRootPage
-	mp, _ := t.pager.GetPage(metaPageNum)
+	mp, _ := t.bTreeMeta.Pager.GetPage(metaPageNum)
 	binary.LittleEndian.PutUint32(mp.Data[metaRootOff:metaRootOff+4], newRootPage)
 	mp.Dirty = true
 	return nil
@@ -178,21 +186,14 @@ func (t *BTree) Insert(key uint32, row Row) error {
 // loadNode reads pageNum, inspects the first byte, and returns
 // either a LeafNode (with meta) or InteriorNode.
 func (t *BTree) loadNode(pageNum uint32) (BTreeNode, error) {
-	p, err := t.pager.GetPage(pageNum)
+	p, err := t.bTreeMeta.Pager.GetPage(pageNum)
 	if err != nil {
 		return nil, err
 	}
 
 	switch p.Data[0] {
 	case nodeTypeLeaf:
-		leaf := &LeafNode{bTreeMeta: t.bTreeMeta}
-		leaf.header.pageNum = pageNum
-		if err := leaf.Load(p); err != nil {
-			return nil, err
-		}
-		// ensure pageNum is set after Load
-		leaf.header.pageNum = pageNum
-		return leaf, nil
+		return t.loadLeafNode(pageNum)
 
 	case nodeTypeInterior:
 		inode := &InteriorNode{bTreeMeta: t.bTreeMeta}
@@ -210,7 +211,21 @@ func (t *BTree) loadNode(pageNum uint32) (BTreeNode, error) {
 
 // AllocatePage hands out the next free page number.
 func (t *BTree) AllocatePage() (uint32, error) {
-	return t.pager.AllocatePage()
+	return t.bTreeMeta.Pager.AllocatePage()
+}
+
+// loadLeafNode creates a LeafNode bound to the given page and loads its data.
+func (t *BTree) loadLeafNode(pageNum uint32) (*LeafNode, error) {
+	p, err := t.bTreeMeta.Pager.GetPage(pageNum)
+	if err != nil {
+		return nil, err
+	}
+	leaf := &LeafNode{bTreeMeta: t.bTreeMeta}
+	leaf.header.pageNum = pageNum
+	if err := leaf.Load(p); err != nil {
+		return nil, err
+	}
+	return leaf, nil
 }
 
 // rootHeader pulls the baseHeader out of a node, if possible.
@@ -222,5 +237,120 @@ func rootHeader(n BTreeNode) *baseHeader {
 		return &v.header
 	default:
 		return nil
+	}
+}
+
+// firstLeaf descends to the left–most leaf of the tree.
+func (t *BTree) firstLeaf() (*LeafNode, uint32, error) {
+	pgno := t.rootPage
+	for {
+		node, err := t.loadNode(pgno)
+		if err != nil {
+			return nil, 0, err
+		}
+		if node.IsLeaf() {
+			return node.(*LeafNode), pgno, nil
+		}
+		in := node.(*InteriorNode)
+		if len(in.cells) > 0 {
+			pgno = in.cells[0].ChildPage
+		} else {
+			pgno = in.header.rightPointer
+		}
+	}
+}
+
+// NewCursor returns a cursor positioned at the first row (if any).
+func (t *BTree) NewCursor() (*Cursor, error) {
+	leaf, pg, err := t.firstLeaf()
+	if err != nil {
+		return nil, err
+	}
+	c := &Cursor{tree: t, leaf: leaf, page: pg}
+	if leaf.header.numCells == 0 {
+		c.valid = false
+	} else {
+		c.idx = 0
+		c.valid = true
+	}
+	return c, nil
+}
+
+// Valid tells whether the cursor is positioned at an existing key/value.
+func (c *Cursor) Valid() bool { return c.valid }
+
+// Key returns the current key. Call only if Valid() is true.
+func (c *Cursor) Key() uint32 { return c.leaf.cells[c.idx].Key }
+
+// Value returns the current row. Call only if Valid() is true.
+func (c *Cursor) Value() Row { return c.leaf.cells[c.idx].Value }
+
+// Next advances to the next key in order.
+func (c *Cursor) Next() error {
+	if !c.valid {
+		return nil
+	}
+	c.idx++
+	if c.idx < int(c.leaf.header.numCells) {
+		return nil
+	}
+	// move to next leaf via rightPointer
+	if c.leaf.header.rightPointer == 0 {
+		c.valid = false
+		return nil
+	}
+	newLeaf, err := c.tree.loadLeafNode(c.leaf.header.rightPointer)
+	if err != nil {
+		return err
+	}
+	c.leaf = newLeaf
+	c.page = newLeaf.Page()
+	if newLeaf.header.numCells == 0 {
+		c.valid = false
+	} else {
+		c.idx = 0
+		c.valid = true
+	}
+	return nil
+}
+
+// Seek repositions the cursor to the first key >= target key.
+func (c *Cursor) Seek(target uint32) error {
+	// Descend from root to leaf
+	pgno := c.tree.rootPage
+	for {
+		node, err := c.tree.loadNode(pgno)
+		if err != nil {
+			return err
+		}
+		if node.IsLeaf() {
+			leaf := node.(*LeafNode)
+			idx := sort.Search(int(leaf.header.numCells), func(i int) bool {
+				return leaf.cells[i].Key >= target
+			})
+			if idx >= int(leaf.header.numCells) {
+				// Target doesn't exist in the tree - interior nodes guaranteed
+				// we're in the correct leaf, so if target > all keys here, it doesn't exist
+				c.valid = false
+				return nil
+			}
+			c.leaf = leaf
+			c.page = pgno
+			c.idx = idx
+			c.valid = true
+			return nil
+		}
+		in := node.(*InteriorNode)
+		// Binary search for the first cell with Key >= target
+		idx := sort.Search(len(in.cells), func(i int) bool {
+			return in.cells[i].Key >= target
+		})
+		var childPg uint32
+		if idx < len(in.cells) {
+			childPg = in.cells[idx].ChildPage
+		} else {
+			childPg = in.header.rightPointer
+		}
+		pgno = childPg
 	}
 }

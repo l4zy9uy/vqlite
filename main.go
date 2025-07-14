@@ -71,13 +71,71 @@ func main() {
 		}
 	}
 
-	// Fetch and print
+	// Create cursor for lookups
+	cursor, err := bt.NewCursor()
+	if err != nil {
+		fmt.Println("create cursor:", err)
+		return
+	}
+
+	// Fetch and print using cursor.Seek()
 	for _, r := range rows {
-		got, found, _ := bt.Search(r[0].(uint32))
-		if !found {
-			fmt.Println("row not found", r[0])
+		key := r[0].(uint32)
+		if err := cursor.Seek(key); err != nil {
+			fmt.Printf("seek error for key %d: %v\n", key, err)
 			continue
 		}
-		fmt.Printf("Row key %d: %v\n", r[0].(uint32), got)
+		if !cursor.Valid() || cursor.Key() != key {
+			fmt.Printf("Row key %d: not found\n", key)
+			continue
+		}
+		fmt.Printf("Row key %d: %v\n", key, cursor.Value())
+	}
+
+	// Demonstrate the power of cursor seeking with more examples
+	fmt.Println("\n--- Demonstrating Cursor Seeking Power ---")
+
+	// Example 1: Exact key lookup
+	fmt.Println("1. Exact key lookup for key 2:")
+	if err := cursor.Seek(2); err != nil {
+		fmt.Println("   Seek error:", err)
+	} else if cursor.Valid() && cursor.Key() == 2 {
+		fmt.Printf("   Found: %v\n", cursor.Value())
+	} else {
+		fmt.Println("   Key 2 not found")
+	}
+
+	// Example 2: Find first key >= target (range start)
+	fmt.Println("2. Find first key >= 1.5 (should position at key 2):")
+	if err := cursor.Seek(1); err != nil { // Note: seeking to 1, should find 2
+		fmt.Println("   Seek error:", err)
+	} else if cursor.Valid() {
+		fmt.Printf("   First key >= 1: %d with value %v\n", cursor.Key(), cursor.Value())
+	} else {
+		fmt.Println("   No keys >= 1")
+	}
+
+	// Example 3: Range iteration - all keys >= 1
+	fmt.Println("3. Range iteration: all users with id >= 1:")
+	if err := cursor.Seek(1); err != nil {
+		fmt.Println("   Seek error:", err)
+	} else {
+		count := 0
+		for cursor.Valid() {
+			fmt.Printf("   - User %d: %s <%s>\n", cursor.Key(), cursor.Value()[1], cursor.Value()[2])
+			count++
+			cursor.Next()
+		}
+		fmt.Printf("   Total: %d users\n", count)
+	}
+
+	// Example 4: Key not found - cursor positioning
+	fmt.Println("4. Seek to non-existent key 10 (should be invalid):")
+	if err := cursor.Seek(10); err != nil {
+		fmt.Println("   Seek error:", err)
+	} else if cursor.Valid() {
+		fmt.Printf("   Unexpected: found key %d\n", cursor.Key())
+	} else {
+		fmt.Println("   Correctly positioned: cursor invalid (key 10 > all existing keys)")
 	}
 }

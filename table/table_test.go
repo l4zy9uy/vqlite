@@ -105,16 +105,26 @@ func TestInsertGetRow_FileBacked(t *testing.T) {
 		}
 	}
 
+	// Create cursor for lookups
+	cursor, err := bt.NewCursor()
+	if err != nil {
+		t.Fatalf("NewCursor: %v", err)
+	}
+
 	for _, want := range rows {
-		got, found, err := bt.Search(want[0].(uint32))
-		if err != nil {
-			t.Fatalf("Search: %v", err)
+		key := want[0].(uint32)
+		if err := cursor.Seek(key); err != nil {
+			t.Fatalf("Seek: %v", err)
 		}
-		if !found {
-			t.Fatalf("key %v not found", want[0])
+		if !cursor.Valid() {
+			t.Fatalf("key %v not found", key)
 		}
+		if cursor.Key() != key {
+			t.Fatalf("cursor positioned at wrong key: got %d, want %d", cursor.Key(), key)
+		}
+		got := cursor.Value()
 		if !reflect.DeepEqual(want, got) {
-			t.Errorf("Row for key %v = %+v; want %+v", want[0], got, want)
+			t.Errorf("Row for key %v = %+v; want %+v", key, got, want)
 		}
 	}
 }
