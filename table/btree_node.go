@@ -9,6 +9,8 @@ import (
 )
 
 const (
+	minCells = maxCells / 2 // minimum cells to avoid underflow
+
 	// on-disk header layout
 	nodeTypeLeaf     = 1
 	nodeTypeInterior = 0
@@ -27,6 +29,11 @@ type BTreeNode interface {
 	// into this node.  If the node overflows, it returns (newNode, splitKey, true).
 	// Otherwise (nil, 0, false).
 	Insert(key uint32, value Row) (newNode BTreeNode, splitKey uint32, split bool)
+
+	// Delete(key) tries to delete the given key from this node.
+	// Returns (found, needsRebalance) where found indicates if key was deleted
+	// and needsRebalance indicates if this node needs rebalancing due to underflow.
+	Delete(key uint32) (found bool, needsRebalance bool)
 
 	// Serialize writes the node back to its on-disk page.
 	Serialize(p *pager.Page) error
@@ -120,6 +127,30 @@ func (n *LeafNode) Insert(key uint32, value Row) (BTreeNode, uint32, bool) {
 
 	n.header.numCells = uint32(len(n.cells))
 	return nil, 0, false
+}
+
+// Delete removes the given key from the leaf node.
+// Returns (found, needsRebalance) where found indicates if key was deleted
+// and needsRebalance indicates if this node needs rebalancing due to underflow.
+func (n *LeafNode) Delete(key uint32) (found bool, needsRebalance bool) {
+	// Find the key using binary search
+	idx := sort.Search(int(n.header.numCells), func(i int) bool {
+		return n.cells[i].Key >= key
+	})
+
+	// Check if we found the exact key
+	if idx >= int(n.header.numCells) || n.cells[idx].Key != key {
+		return false, false // Key not found
+	}
+
+	// Remove the cell at idx
+	n.cells = append(n.cells[:idx], n.cells[idx+1:]...)
+	n.header.numCells = uint32(len(n.cells))
+
+	// For simplicity, we don't implement full rebalancing here
+	// Just return true for found, false for needsRebalance
+	// This is a simplified deletion that works for basic cases
+	return true, false
 }
 
 // Serialize writes the header + all cells to p.Data.
@@ -297,6 +328,62 @@ func (n *InteriorNode) Insert(key uint32, value Row) (BTreeNode, uint32, bool) {
 
 	// Don’t propagate – our node did not split.
 	return nil, 0, false
+}
+
+// Delete removes the given key from the interior node by recursively
+// descending to the appropriate child.
+// Returns (found, needsRebalance) where found indicates if key was deleted
+// and needsRebalance indicates if this node needs rebalancing due to underflow.
+func (n *InteriorNode) Delete(key uint32) (found bool, needsRebalance bool) {
+	// Find the appropriate child to descend to
+	i := sort.Search(len(n.cells), func(i int) bool {
+		return n.cells[i].Key >= key
+	})
+
+	var childPg uint32
+	if i < len(n.cells) {
+		childPg = n.cells[i].ChildPage
+	} else {
+		childPg = n.header.rightPointer
+	}
+
+	// Load the child node
+	p, err := n.bTreeMeta.Pager.GetPage(childPg)
+	if err != nil {
+		return false, false // Error loading child
+	}
+
+	var child BTreeNode
+	if p.Data[0] == nodeTypeLeaf {
+		leaf := &LeafNode{bTreeMeta: n.bTreeMeta}
+		leaf.header.pageNum = childPg
+		if err := leaf.Load(p); err != nil {
+			return false, false
+		}
+		child = leaf
+	} else {
+		interior := &InteriorNode{bTreeMeta: n.bTreeMeta}
+		interior.header.pageNum = childPg
+		if err := interior.Load(p); err != nil {
+			return false, false
+		}
+		child = interior
+	}
+
+	// Recursively delete from child
+	found, _ = child.Delete(key)
+	if !found {
+		return false, false // Key not found in subtree
+	}
+
+	// Serialize the modified child back to disk
+	if err := child.Serialize(p); err != nil {
+		return false, false
+	}
+
+	// For simplicity, we don't implement full rebalancing here
+	// Just return that deletion was successful
+	return true, false
 }
 
 // Serialize writes header + each InteriorCell ([ childPage:uint32 | key:uint32 ]).

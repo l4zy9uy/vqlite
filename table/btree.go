@@ -112,6 +112,32 @@ func (t *BTree) Insert(key uint32, row Row) error {
 	return t.handleRootSplit(root, sibling, splitKey)
 }
 
+// Delete removes the given key from the tree.
+// Returns true if the key was found and deleted, false if not found.
+func (t *BTree) Delete(key uint32) (bool, error) {
+	root, err := t.loadNode(t.rootPage)
+	if err != nil {
+		return false, fmt.Errorf("failed to load root node: %w", err)
+	}
+
+	found, _ := root.Delete(key)
+	if !found {
+		return false, nil // Key not found
+	}
+
+	// Serialize the root back to disk
+	page, err := t.bTreeMeta.Pager.GetPage(t.rootPage)
+	if err != nil {
+		return false, fmt.Errorf("failed to get root page for serialization: %w", err)
+	}
+
+	if err := root.Serialize(page); err != nil {
+		return false, fmt.Errorf("failed to serialize root node: %w", err)
+	}
+
+	return true, nil
+}
+
 // handleNoSplit handles the case where insertion doesn't cause a split.
 func (t *BTree) handleNoSplit(root BTreeNode) error {
 	page, err := t.bTreeMeta.Pager.GetPage(t.rootPage)
