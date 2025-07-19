@@ -75,41 +75,67 @@ func NewBTree(p *pager.Pager, tblMeta *TableMeta) (*BTree, error) {
 	return &BTree{rootPage: rootPg, bTreeMeta: btMeta}, nil
 }
 
-// Search looks for key in the tree.
-// Returns the full row, true if found, or (nil,false,nil) if not.
-func (t *BTree) Search(key uint32) (Row, bool, error) {
-	// Use cursor's efficient Seek functionality
-	cursor, err := t.NewCursor()
+// Search descends from the root with the given cursor, returns comparison result and error.
+func (t *BTree) Search(c *Cursor, key uint32) (int, error) {
+	root, err := t.loadNode(t.rootPage)
 	if err != nil {
-		return nil, false, err
+		return 0, err
 	}
-
-	// Seek to the target key
-	if err := cursor.Seek(key); err != nil {
-		return nil, false, err
-	}
-
-	// Check if we found the exact key
-	if cursor.Valid() && cursor.Key() == key {
-		return cursor.Value(), true, nil
-	}
-
-	return nil, false, nil
+	return root.Search(c, key)
 }
 
 // Insert adds key+row into the tree, splitting and promoting at the root if needed.
-func (t *BTree) Insert(key uint32, row Row) error {
-	root, err := t.loadNode(t.rootPage)
+func (t *BTree) Insert(c *Cursor, key uint32, row Row) error {
+	leaf := c.leaf
+
+	// 1) If key exists at cursor, overwrite
+	if c.Valid() && leaf.cells[c.idx].Key == key {
+		leaf.cells[c.idx].Value = row
+		pg, err := t.bTreeMeta.Pager.GetPage(leaf.Page())
+		if err != nil {
+			return fmt.Errorf("insert: get leaf page: %w", err)
+		}
+		return leaf.Serialize(pg)
+	}
+
+	// 2) Otherwise insert into leaf
+	sibling, splitKey, didSplit := leaf.Insert(c, key, row)
+	pg, err := t.bTreeMeta.Pager.GetPage(leaf.Page())
 	if err != nil {
-		return fmt.Errorf("failed to load root node: %w", err)
+		return fmt.Errorf("insert: get leaf page: %w", err)
 	}
-
-	sibling, splitKey, didSplit := root.Insert(key, row)
 	if !didSplit {
-		return t.handleNoSplit(root)
+		return leaf.Serialize(pg)
 	}
 
-	return t.handleRootSplit(root, sibling, splitKey)
+	// 3) Propagate splits up
+	var leftNode BTreeNode = leaf
+	var rightNode BTreeNode = sibling
+	upKey := splitKey
+
+	for {
+		parentPg := leftNode.(*InteriorNode).header.parentPage
+		// reached root: build new root
+		if parentPg == 0 {
+			return t.handleRootSplit(leftNode, rightNode, upKey)
+		}
+
+		parent, err := t.loadNode(parentPg)
+		if err != nil {
+			return fmt.Errorf("insert: load parent page %d: %w", parentPg, err)
+		}
+
+		// splice into interior; pass cursor for API consistency
+		newSib, newKey, split := parent.(*InteriorNode).Insert(c, upKey, row)
+		if !split {
+			ppg, _ := t.bTreeMeta.Pager.GetPage(parent.Page())
+			return parent.Serialize(ppg)
+		}
+
+		leftNode = parent
+		rightNode = newSib
+		upKey = newKey
+	}
 }
 
 // Delete removes the given key from the tree.
@@ -443,148 +469,25 @@ type KeyRowPair struct {
 	Row Row
 }
 
-// BulkLoad efficiently loads a large number of sorted key-value pairs into the B+ tree.
-// This method replaces the existing tree content and builds a new tree from scratch
-// using a bottom-up approach for optimal performance.
-//
-// Requirements:
-// - data must be sorted by key in ascending order
-// - keys must be unique
-// - data should contain at least one entry
-//
-// The algorithm works by:
-// 1. Building leaf pages from left to right, packing them efficiently
-// 2. Constructing interior levels bottom-up until reaching a single root
-// 3. Replacing the old tree with the new efficiently constructed tree
-func (t *BTree) BulkLoad(data []KeyRowPair) error {
-	if len(data) == 0 {
-		return fmt.Errorf("BulkLoad: empty data slice")
-	}
-
-	// Validate that data is sorted and has unique keys
-	if err := t.validateBulkData(data); err != nil {
-		return fmt.Errorf("BulkLoad: %w", err)
-	}
-
-	// Build the tree from bottom up
-	newRootPage, err := t.buildTreeBottomUp(data)
-	if err != nil {
-		return fmt.Errorf("BulkLoad: failed to build tree: %w", err)
-	}
-
-	// Replace the old tree with the new one
-	if err := t.replaceTree(newRootPage); err != nil {
-		return fmt.Errorf("BulkLoad: failed to replace tree: %w", err)
-	}
-
-	return nil
-}
-
-// validateBulkData ensures the input data is properly sorted and contains unique keys
-func (t *BTree) validateBulkData(data []KeyRowPair) error {
-	if len(data) == 0 {
-		return fmt.Errorf("data slice is empty")
-	}
-
-	// Check that keys are sorted and unique
-	for i := 1; i < len(data); i++ {
-		if data[i-1].Key >= data[i].Key {
-			return fmt.Errorf("data is not sorted or contains duplicate keys at index %d (key %d >= %d)",
-				i-1, data[i-1].Key, data[i].Key)
-		}
-	}
-
-	// Validate that each row matches the table schema
-	for i, pair := range data {
-		if len(pair.Row) != t.bTreeMeta.TableMeta.NumCols {
-			return fmt.Errorf("row at index %d has %d columns, expected %d",
-				i, len(pair.Row), t.bTreeMeta.TableMeta.NumCols)
-		}
-	}
-
-	return nil
-}
-
-// buildTreeBottomUp constructs the B+ tree using a bottom-up approach
-func (t *BTree) buildTreeBottomUp(data []KeyRowPair) (uint32, error) {
-	// Step 1: Build all leaf pages and collect their metadata
-	leafPages, err := t.buildLeafLevel(data)
-	if err != nil {
-		return 0, fmt.Errorf("failed to build leaf level: %w", err)
-	}
-
-	// Step 2: If we only have one leaf, it becomes the root
-	if len(leafPages) == 1 {
-		// Mark the single leaf as root
-		leaf, err := t.loadLeafNode(leafPages[0].PageNum)
-		if err != nil {
-			return 0, fmt.Errorf("failed to load single leaf: %w", err)
-		}
-		leaf.header.isRoot = true
-
-		page, err := t.bTreeMeta.Pager.GetPage(leafPages[0].PageNum)
-		if err != nil {
-			return 0, fmt.Errorf("failed to get page for single leaf: %w", err)
-		}
-
-		if err := leaf.Serialize(page); err != nil {
-			return 0, fmt.Errorf("failed to serialize single leaf root: %w", err)
-		}
-
-		return leafPages[0].PageNum, nil
-	}
-
-	// Step 3: Build interior levels bottom-up
-	currentLevel := leafPages
-	for len(currentLevel) > 1 {
-		nextLevel, err := t.buildInteriorLevel(currentLevel)
-		if err != nil {
-			return 0, fmt.Errorf("failed to build interior level: %w", err)
-		}
-		currentLevel = nextLevel
-	}
-
-	// Step 4: Mark the final root and return its page number
-	rootPageNum := currentLevel[0].PageNum
-	root, err := t.loadNode(rootPageNum)
-	if err != nil {
-		return 0, fmt.Errorf("failed to load final root: %w", err)
-	}
-
-	if hdr := rootHeader(root); hdr != nil {
-		hdr.isRoot = true
-		page, err := t.bTreeMeta.Pager.GetPage(rootPageNum)
-		if err != nil {
-			return 0, fmt.Errorf("failed to get root page: %w", err)
-		}
-		if err := root.Serialize(page); err != nil {
-			return 0, fmt.Errorf("failed to serialize root: %w", err)
-		}
-	}
-
-	return rootPageNum, nil
-}
-
-// PageInfo represents metadata about a constructed page
+// PageInfo represents a page during bulk loading with its minimum key
 type PageInfo struct {
-	PageNum uint32
-	MinKey  uint32 // smallest key in this subtree
+	pageNum uint32
+	minKey  uint32
 }
 
-// buildLeafLevel constructs all leaf pages and links them together
-func (t *BTree) buildLeafLevel(data []KeyRowPair) ([]PageInfo, error) {
-	var leafPages []PageInfo
+// buildAllLeaves creates and fills all leaf pages
+func (t *BTree) buildAllLeaves(data []KeyRowPair) ([]*LeafNode, error) {
+	var leaves []*LeafNode
 	dataIdx := 0
 
 	for dataIdx < len(data) {
-		// Create a new leaf page
-		leaf, err := NewLeafNode(t.bTreeMeta, false) // not root initially
+		// Create a new leaf
+		leaf, err := NewLeafNode(t.bTreeMeta, false)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create leaf node: %w", err)
+			return nil, fmt.Errorf("failed to create leaf: %w", err)
 		}
 
-		// Fill the leaf with data up to maxCells
-		startIdx := dataIdx
+		// Fill leaf to capacity or until we run out of data
 		for dataIdx < len(data) && len(leaf.cells) < maxCells {
 			pair := data[dataIdx]
 			leaf.cells = append(leaf.cells, LeafCell{
@@ -596,99 +499,32 @@ func (t *BTree) buildLeafLevel(data []KeyRowPair) ([]PageInfo, error) {
 
 		leaf.header.numCells = uint32(len(leaf.cells))
 
-		// Link to the next leaf if this isn't the last one
-		if dataIdx < len(data) {
-			// We'll set the rightPointer after creating the next leaf
-			// For now, we'll update it in a second pass
-		}
-
-		// Serialize the leaf to disk
-		page, err := t.bTreeMeta.Pager.GetPage(leaf.Page())
-		if err != nil {
-			return nil, fmt.Errorf("failed to get leaf page: %w", err)
-		}
-		if err := leaf.Serialize(page); err != nil {
+		// Serialize the leaf
+		if err := t.serializeNode(leaf); err != nil {
 			return nil, fmt.Errorf("failed to serialize leaf: %w", err)
 		}
 
-		// Record this leaf's info
-		leafPages = append(leafPages, PageInfo{
-			PageNum: leaf.Page(),
-			MinKey:  data[startIdx].Key,
-		})
+		leaves = append(leaves, leaf)
 	}
 
-	// Second pass: set up rightPointer links between leaves
-	for i := 0; i < len(leafPages)-1; i++ {
-		leaf, err := t.loadLeafNode(leafPages[i].PageNum)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load leaf for linking: %w", err)
-		}
-
-		leaf.header.rightPointer = leafPages[i+1].PageNum
-
-		page, err := t.bTreeMeta.Pager.GetPage(leafPages[i].PageNum)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get leaf page for linking: %w", err)
-		}
-		if err := leaf.Serialize(page); err != nil {
+	// Link leaves together with rightPointers
+	for i := 0; i < len(leaves)-1; i++ {
+		leaves[i].header.rightPointer = leaves[i+1].Page()
+		if err := t.serializeNode(leaves[i]); err != nil {
 			return nil, fmt.Errorf("failed to serialize linked leaf: %w", err)
 		}
 	}
 
-	return leafPages, nil
+	return leaves, nil
 }
 
-// buildInteriorLevel constructs interior nodes from the pages at the level below
-func (t *BTree) buildInteriorLevel(childPages []PageInfo) ([]PageInfo, error) {
-	var interiorPages []PageInfo
-	childIdx := 0
-
-	for childIdx < len(childPages) {
-		// Create a new interior node
-		interior, err := NewInteriorNode(t.bTreeMeta, false) // not root initially
-		if err != nil {
-			return nil, fmt.Errorf("failed to create interior node: %w", err)
-		}
-
-		// Fill the interior with child pointers up to maxCells
-		startIdx := childIdx
-
-		// First child becomes the rightmost pointer (standard B+ tree structure)
-		if childIdx < len(childPages) {
-			interior.header.rightPointer = childPages[childIdx].PageNum
-			childIdx++
-		}
-
-		// Add remaining children as regular cells
-		for childIdx < len(childPages) && len(interior.cells) < maxCells {
-			child := childPages[childIdx]
-			interior.cells = append(interior.cells, InteriorCell{
-				ChildPage: child.PageNum,
-				Key:       child.MinKey,
-			})
-			childIdx++
-		}
-
-		interior.header.numCells = uint32(len(interior.cells))
-
-		// Serialize the interior node
-		page, err := t.bTreeMeta.Pager.GetPage(interior.Page())
-		if err != nil {
-			return nil, fmt.Errorf("failed to get interior page: %w", err)
-		}
-		if err := interior.Serialize(page); err != nil {
-			return nil, fmt.Errorf("failed to serialize interior: %w", err)
-		}
-
-		// Record this interior node's info
-		interiorPages = append(interiorPages, PageInfo{
-			PageNum: interior.Page(),
-			MinKey:  childPages[startIdx].MinKey, // minimum key in subtree
-		})
+// serializeNode serializes a node to its page
+func (t *BTree) serializeNode(node BTreeNode) error {
+	page, err := t.bTreeMeta.Pager.GetPage(node.Page())
+	if err != nil {
+		return fmt.Errorf("failed to get page %d: %w", node.Page(), err)
 	}
-
-	return interiorPages, nil
+	return node.Serialize(page)
 }
 
 // replaceTree updates the tree to use the new root and updates metadata

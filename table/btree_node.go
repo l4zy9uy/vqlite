@@ -22,15 +22,15 @@ const (
 type BTreeNode interface {
 	Page() uint32
 
-	// IsLeaf() tells us whether this is a leaf or interior node.
+	// IsLeaf tells us whether this is a leaf or interior node.
 	IsLeaf() bool
 
-	// Insert(key, value) tries to insert the given key and value
+	// Insert tries to insert the given key and value
 	// into this node.  If the node overflows, it returns (newNode, splitKey, true).
 	// Otherwise (nil, 0, false).
-	Insert(key uint32, value Row) (newNode BTreeNode, splitKey uint32, split bool)
+	Insert(c *Cursor, key uint32, value Row) (newNode BTreeNode, splitKey uint32, split bool)
 
-	// Delete(key) tries to delete the given key from this node.
+	// Delete tries to delete the given key from this node.
 	// Returns (found, needsRebalance) where found indicates if key was deleted
 	// and needsRebalance indicates if this node needs rebalancing due to underflow.
 	Delete(key uint32) (found bool, needsRebalance bool)
@@ -40,6 +40,9 @@ type BTreeNode interface {
 
 	// Load populates this node’s in-memory fields from its on-disk page.
 	Load(p *pager.Page) error
+
+	// Search for a key recursively, returning (cmp, idx, err)
+	Search(c *Cursor, key uint32) (int, error)
 }
 
 type LeafCell struct {
@@ -94,39 +97,68 @@ func NewLeafNode(meta *BTreeMeta, isRoot bool) (*LeafNode, error) {
 	return n, nil
 }
 
-// Insert a key/value into the sorted leaf.  If overflow, split.
-func (n *LeafNode) Insert(key uint32, value Row) (BTreeNode, uint32, bool) {
-	// find insertion index
-	idx := sort.Search(int(n.header.numCells), func(i int) bool {
+func (n *LeafNode) Search(c *Cursor, key uint32) (int, error) {
+	// 1) Binary‐search in this leaf
+	idx := sort.Search(len(n.cells), func(i int) bool {
 		return n.cells[i].Key >= key
 	})
 
-	newCell := LeafCell{Key: key, Value: value}
-	n.cells = slices.Insert(n.cells, idx, newCell)
-
-	if len(n.cells) > maxCells {
-		// 2) Build the sibling with that page number:
-		sibling, err := NewLeafNode(n.bTreeMeta, false)
-		if err != nil {
-			panic(err)
-		}
-		//      copy the “right half” of the cells into it:
-		mid := len(n.cells) / 2
-		sibling.cells = append(sibling.cells, n.cells[mid:]...)
-		sibling.header.numCells = uint32(len(sibling.cells))
-		sibling.header.rightPointer = n.header.rightPointer
-
-		// 3) Trim the original:
-		n.cells = n.cells[:mid]
-		n.header.numCells = uint32(len(n.cells))
-		n.header.rightPointer = sibling.Page()
-
-		// 4) Return sibling (with its pageNum set!), the splitKey, and true:
-		return sibling, sibling.cells[0].Key, true
+	// 2) Update the cursor
+	c.leaf = n                // this leaf
+	c.page = n.header.pageNum // its page number
+	c.idx = idx               // slot index
+	// 3) Decide exact vs before vs after
+	if idx < len(n.cells) && n.cells[idx].Key == key {
+		c.valid = true
+		return 0, nil
 	}
+	c.valid = false
+	if idx == len(n.cells) {
+		return +1, nil
+	}
+	return -1, nil
+}
 
+// Insert uses c.idx (positioned by Search) to insert or update in-place. On overflow, splits and updates cursor.
+func (n *LeafNode) Insert(c *Cursor, key uint32, value Row) (BTreeNode, uint32, bool) {
+	idx := c.idx
+	// update existing
+	if idx < len(n.cells) && n.cells[idx].Key == key {
+		n.cells[idx].Value = value
+		n.header.numCells = uint32(len(n.cells))
+		return nil, 0, false
+	}
+	// clamp insertion index
+	if idx > len(n.cells) {
+		idx = len(n.cells)
+	}
+	// insert new cell
+	n.cells = slices.Insert(n.cells, idx, LeafCell{Key: key, Value: value})
 	n.header.numCells = uint32(len(n.cells))
-	return nil, 0, false
+	// no split
+	if len(n.cells) <= maxCells {
+		c.idx = idx
+		return nil, 0, false
+	}
+	// split leaf
+	sib, _ := NewLeafNode(n.bTreeMeta, false)
+	sib.header.parentPage = n.header.parentPage
+	sib.header.rightPointer = n.header.rightPointer
+	mid := len(n.cells) / 2
+	sib.cells = append(sib.cells, n.cells[mid:]...)
+	sib.header.numCells = uint32(len(sib.cells))
+	n.cells = n.cells[:mid]
+	n.header.numCells = uint32(len(n.cells))
+	n.header.rightPointer = sib.Page()
+	// determine new cursor position
+	if idx >= mid {
+		c.leaf = sib
+		c.idx = idx - mid
+	} else {
+		c.idx = idx
+	}
+	splitKey := sib.cells[0].Key
+	return sib, splitKey, true
 }
 
 // Delete removes the given key from the leaf node.
@@ -245,89 +277,72 @@ func NewInteriorNode(meta *BTreeMeta, isRoot bool) (*InteriorNode, error) {
 	return n, nil
 }
 
-// Insert is a stub: you’ll hook in recursive descent and splitting here next.
-// InteriorNode.Insert inserts into an interior. Propagates splits upward.
-func (n *InteriorNode) Insert(key uint32, value Row) (BTreeNode, uint32, bool) {
-	// 1) find child index
+// Insert descends to child, recurses, and splices on split; splits this node if needed.
+// Cursor is accepted for API consistency but only used at leaf level.
+func (n *InteriorNode) Insert(c *Cursor, key uint32, value Row) (BTreeNode, uint32, bool) {
+	// find branch index
 	i := sort.Search(len(n.cells), func(i int) bool { return n.cells[i].Key >= key })
-	// choose the child page
 	var childPg uint32
 	if i < len(n.cells) {
 		childPg = n.cells[i].ChildPage
 	} else {
 		childPg = n.header.rightPointer
 	}
-	// 2) load child page
-	p, _ := n.bTreeMeta.Pager.GetPage(childPg)
-	// 3) instantiate child node struct _without allocating new pages_
+
+	// load child node
+	page, _ := n.bTreeMeta.Pager.GetPage(childPg)
 	var child BTreeNode
-	if p.Data[0] == nodeTypeLeaf {
-		// Use a zero LeafNode bound to the existing page
+	if page.Data[0] == nodeTypeLeaf {
 		leaf := &LeafNode{bTreeMeta: n.bTreeMeta}
 		leaf.header.pageNum = childPg
+		leaf.Load(page)
 		child = leaf
 	} else {
 		in := &InteriorNode{bTreeMeta: n.bTreeMeta}
 		in.header.pageNum = childPg
+		in.Load(page)
 		child = in
 	}
-	// populate it from disk
-	if err := child.Load(p); err != nil {
-		return nil, 0, false // propagate error silently for now
-	}
-	// 4) recurse
-	sib, splitKey, didSplit := child.Insert(key, value)
+
+	// recurse
+	sib, splitKey, didSplit := child.Insert(c, key, value)
 	if !didSplit {
-		// Child accepted insert with no split: serialize child back and we’re done.
-		child.Serialize(p)
 		return nil, 0, false
 	}
-	// 5) splice new cell
-	// Child split – insert separator key+pointer into this node
+
+	// splice in new child pointer
 	n.cells = slices.Insert(n.cells, i, InteriorCell{ChildPage: sib.Page(), Key: splitKey})
 	n.header.numCells = uint32(len(n.cells))
-	// 6) handle interior overflow
-	if len(n.cells) > maxCells {
-		// This interior now overflows – split it as well
-		sibInt, err := NewInteriorNode(n.bTreeMeta, false)
-		if err != nil {
-			panic(err)
-		}
-		mid := len(n.cells) / 2
-		// median cell to push up
-		med := n.cells[mid]
-		// right half -> sibling
-		sibInt.cells = append(sibInt.cells, n.cells[mid+1:]...)
-		sibInt.header.numCells = uint32(len(sibInt.cells))
-		sibInt.header.rightPointer = n.header.rightPointer
-		// left keep
-		n.cells = n.cells[:mid]
-		n.header.numCells = uint32(len(n.cells))
-		n.header.rightPointer = med.ChildPage
-		// Serialize left (n) and right (sibInt) nodes
-		if pgN, _ := n.bTreeMeta.Pager.GetPage(n.Page()); pgN != nil {
-			n.Serialize(pgN)
-		}
-		if pgS, _ := n.bTreeMeta.Pager.GetPage(sibInt.Page()); pgS != nil {
-			sibInt.Serialize(pgS)
-		}
 
-		// propagate split upward
-		return sibInt, med.Key, true
-	}
-	// No overflow after inserting separator. Serialize self and child/sibling.
-	if pgChild, _ := n.bTreeMeta.Pager.GetPage(child.Page()); pgChild != nil {
-		child.Serialize(pgChild)
-	}
-	if pgSib, _ := n.bTreeMeta.Pager.GetPage(sib.Page()); pgSib != nil {
-		sib.Serialize(pgSib)
-	}
-	if pgSelf, _ := n.bTreeMeta.Pager.GetPage(n.Page()); pgSelf != nil {
-		n.Serialize(pgSelf)
+	// if no overflow, serialize
+	if len(n.cells) <= maxCells {
+		p, _ := n.bTreeMeta.Pager.GetPage(n.Page())
+		n.Serialize(p)
+		return nil, 0, false
 	}
 
-	// Don’t propagate – our node did not split.
-	return nil, 0, false
+	// split interior node
+	sibInt, _ := NewInteriorNode(n.bTreeMeta, false)
+	sibInt.header.parentPage = n.header.parentPage
+	mid := len(n.cells) / 2
+	med := n.cells[mid]
+
+	sibInt.cells = append(sibInt.cells, n.cells[mid+1:]...)
+	sibInt.header.numCells = uint32(len(sibInt.cells))
+	sibInt.header.rightPointer = n.header.rightPointer
+
+	n.cells = n.cells[:mid]
+	n.header.numCells = uint32(len(n.cells))
+	n.header.rightPointer = med.ChildPage
+
+	// serialize both halves
+	if pN, _ := n.bTreeMeta.Pager.GetPage(n.Page()); pN != nil {
+		n.Serialize(pN)
+	}
+	if pS, _ := n.bTreeMeta.Pager.GetPage(sibInt.Page()); pS != nil {
+		sibInt.Serialize(pS)
+	}
+	return sibInt, med.Key, true
 }
 
 // Delete removes the given key from the interior node by recursively
@@ -417,4 +432,29 @@ func (n *InteriorNode) Load(p *pager.Page) error {
 		n.cells[i] = InteriorCell{ChildPage: child, Key: key}
 	}
 	return nil
+}
+
+// Search on an interior page: pick the correct child, load it, and recurse.
+// Returns –1/0/+1 from the eventual leaf, and updates the same *Cursor.
+func (n *InteriorNode) Search(c *Cursor, key uint32) (int, error) {
+	// 1) Find the first cell whose Key > search key
+	childIdx := sort.Search(len(n.cells), func(i int) bool {
+		return n.cells[i].Key >= key
+	})
+
+	// 2) Choose the child page pointer
+	var childPg uint32
+	if childIdx < len(n.cells) {
+		childPg = n.cells[childIdx].ChildPage
+	} else {
+		childPg = n.header.rightPointer
+	}
+
+	// 3) Load that child node
+	node, err := c.tree.loadNode(childPg)
+	if err != nil {
+		return 0, err
+	}
+
+	return node.Search(c, key)
 }
